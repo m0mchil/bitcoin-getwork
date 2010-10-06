@@ -1,0 +1,479 @@
+Index: main.cpp
+===================================================================
+--- main.cpp	(revision 161)
++++ main.cpp	(working copy)
+@@ -2923,8 +2923,154 @@
+ extern unsigned int ScanHash_4WaySSE2(char* pmidstate, char* pblock, char* phash1, char* phash, unsigned int& nHashesDone);
+ 
+ 
++CBlock* pWorkBlock = new CBlock();
++CKey workKey;
++CBigNum txInNonce = 0;
++unsigned int nsTransactionsUpdatedLast;
++CCriticalSection work;
++void CheckWork(Workspace& tmp, CBigNum& extraNonce)
++{
++	CRITICAL_BLOCK(work)
++	CRITICAL_BLOCK(cs_main)
++	{
++		for (int i = 0; i < sizeof(tmp)/4; i++)
++			((unsigned int*)&tmp)[i] = ByteReverse(((unsigned int*)&tmp)[i]);
++		if (tmp.block.hashPrevBlock != 0 && tmp.block.hashPrevBlock == pWorkBlock->hashPrevBlock)
++		{
++			CBlock* pBlock = new CBlock(); // released in ProcessBlock
++			*pBlock = *pWorkBlock;
++			pBlock->nTime = tmp.block.nTime;
++			pBlock->nNonce = tmp.block.nNonce;
++			pBlock->vtx[0].vin[0].scriptSig.clear();
++			pBlock->vtx[0].vin[0].scriptSig << GetNextWorkRequired(pindexBest) << extraNonce;
++			pBlock->hashMerkleRoot = pBlock->BuildMerkleTree();
++			uint256 hash = pBlock->GetHash();
++			uint256 hashTarget = CBigNum().SetCompact(pWorkBlock->nBits).getuint256();
++			if (hash <= hashTarget)
++			{
++				//// debug print
++                printf("proof-of-work found  \n  hash: %s  \ntarget: %s\n", hash.GetHex().c_str(), hashTarget.GetHex().c_str());
++                pBlock->print();
++                printf("%s ", DateTimeStrFormat("%x %H:%M", GetTime()).c_str());
++                printf("generated %s\n", FormatMoney(pBlock->vtx[0].vout[0].nValue).c_str());
++				
++				if (AddKey(workKey))
++				{
++					workKey.MakeNewKey();
+ 
++					CRITICAL_BLOCK(cs_mapRequestCount)
++						mapRequestCount[pWorkBlock->GetHash()] = 0;
++					if (!ProcessBlock(NULL, pBlock))
++					{					
++						printf("ERROR in CheckWork, ProcessBlock, block not accepted\n");
++					}
++				}
++				else
++				{
++					printf("ERROR in CheckWork, AddKey failed\n");
++				}
++			}
++		}
++	}
++}
+ 
++void PrepareWork(Workspace& workspace, uint256& state, uint256& target, CBigNum& extraNonce)
++{
++	CRITICAL_BLOCK(work)
++	{
++		if (workKey.IsNull())
++		{
++			workKey.MakeNewKey();
++		}
++
++		CBlockIndex* pIndexPrev = pindexBest;
++		unsigned int nBits = GetNextWorkRequired(pIndexPrev);
++		extraNonce = ++txInNonce;	
++		if (nTransactionsUpdated != nsTransactionsUpdatedLast || pWorkBlock->hashPrevBlock != pIndexPrev->GetBlockHash())
++		{
++			nsTransactionsUpdatedLast = nTransactionsUpdated;
++			
++			pWorkBlock->vtx.clear();
++
++			CTransaction txNew;
++			txNew.vin.resize(1);
++			txNew.vin[0].prevout.SetNull();
++			txNew.vout.resize(1);
++			txNew.vout[0].scriptPubKey << workKey.GetPubKey() << OP_CHECKSIG;
++			pWorkBlock->vtx.push_back(txNew);
++
++			int64 nFees = 0;
++			CRITICAL_BLOCK(cs_main)
++			CRITICAL_BLOCK(cs_mapTransactions)
++			{
++				CTxDB txdb("r");
++				map<uint256, CTxIndex> mapTestPool;
++				vector<char> vfAlreadyAdded(mapTransactions.size());
++				bool fFoundSomething = true;
++				uint64 nBlockSize = 1000;
++				int nBlockSigOps = 100;
++				while (fFoundSomething)
++				{
++					fFoundSomething = false;
++					unsigned int n = 0;
++					for (map<uint256, CTransaction>::iterator mi = mapTransactions.begin(); mi != mapTransactions.end(); ++mi, ++n)
++					{
++						if (vfAlreadyAdded[n])
++							continue;
++						CTransaction& tx = (*mi).second;
++						if (tx.IsCoinBase() || !tx.IsFinal())
++							continue;
++						unsigned int nTxSize = ::GetSerializeSize(tx, SER_NETWORK);
++						if (nBlockSize + nTxSize >= MAX_BLOCK_SIZE_GEN)
++							continue;
++						int nTxSigOps = tx.GetSigOpCount();
++						if (nBlockSigOps + nTxSigOps >= MAX_BLOCK_SIGOPS)
++							continue;
++
++						// Transaction fee based on block size
++						int64 nMinFee = tx.GetMinFee(nBlockSize);
++
++						map<uint256, CTxIndex> mapTestPoolTmp(mapTestPool);
++						if (!tx.ConnectInputs(txdb, mapTestPoolTmp, CDiskTxPos(1,1,1), pIndexPrev, nFees, false, true, nMinFee))
++							continue;
++						swap(mapTestPool, mapTestPoolTmp);
++
++						pWorkBlock->vtx.push_back(tx);
++						nBlockSize += nTxSize;
++						nBlockSigOps += nTxSigOps;
++						vfAlreadyAdded[n] = true;
++						fFoundSomething = true;
++					}
++				}
++			}
++			pWorkBlock->vtx[0].vout[0].nValue = GetBlockValue(pIndexPrev->nHeight+1, nFees);
++
++			pWorkBlock->hashPrevBlock         = (pIndexPrev ? pIndexPrev->GetBlockHash() : 0);
++			pWorkBlock->nBits                 = nBits;	
++		}
++		
++		pWorkBlock->vtx[0].vin[0].scriptSig.clear();
++		pWorkBlock->vtx[0].vin[0].scriptSig << nBits << txInNonce;
++
++		workspace.block.nVersion       = pWorkBlock->nVersion;
++		workspace.block.hashPrevBlock  = pWorkBlock->hashPrevBlock;
++		workspace.block.hashMerkleRoot = pWorkBlock->hashMerkleRoot        = pWorkBlock->BuildMerkleTree();
++		workspace.block.nTime          = max((pIndexPrev ? pIndexPrev->GetMedianTimePast()+1 : 0), GetAdjustedTime());
++		workspace.block.nBits          = pWorkBlock->nBits;
++		workspace.block.nNonce         = 0;
++
++		unsigned int nBlocks0 = FormatHashBlocks(&workspace.block, sizeof(workspace.block));
++		unsigned int nBlocks1 = FormatHashBlocks(&workspace.hash1, sizeof(workspace.hash1));
++		
++		target = CBigNum().SetCompact(pWorkBlock->nBits).getuint256();
++
++		for (int i = 0; i < sizeof(workspace)/4; i++)
++			((unsigned int*)&workspace)[i] = ByteReverse(((unsigned int*)&workspace)[i]);
++
++		SHA256Transform(&state, &workspace.block, pSHA256InitState);
++	}
++}
++
+ void BitcoinMiner()
+ {
+     printf("BitcoinMiner started\n");
+@@ -2933,9 +3079,12 @@
+     if (mapArgs.count("-4way"))
+         f4WaySSE2 = (mapArgs["-4way"] != "0");
+ 
+-    CKey key;
+-    key.MakeNewKey();
+-    CBigNum bnExtraNonce = 0;
++    CBigNum extraNonce;
++	uint256 midstatebuf2[2];
++	uint256& midstate = *alignup<16>(midstatebuf2);	
++	char tmpbuf2[sizeof(Workspace)+16];
++	Workspace& tmp = *(Workspace*)alignup<16>(tmpbuf2);
++	uint256 hashTarget;
+     while (fGenerateBitcoins)
+     {
+         Sleep(50);
+@@ -2952,127 +3101,16 @@
+ 
+         unsigned int nTransactionsUpdatedLast = nTransactionsUpdated;
+         CBlockIndex* pindexPrev = pindexBest;
+-        unsigned int nBits = GetNextWorkRequired(pindexPrev);
+ 
++		PrepareWork(tmp, midstate, hashTarget, extraNonce);
++		
++		printf("Running BitcoinMiner with %d transactions in block\n", pWorkBlock->vtx.size());
+ 
+-        //
+-        // Create coinbase tx
+-        //
+-        CTransaction txNew;
+-        txNew.vin.resize(1);
+-        txNew.vin[0].prevout.SetNull();
+-        txNew.vin[0].scriptSig << nBits << ++bnExtraNonce;
+-        txNew.vout.resize(1);
+-        txNew.vout[0].scriptPubKey << key.GetPubKey() << OP_CHECKSIG;
+ 
+-
+         //
+-        // Create new block
+-        //
+-        auto_ptr<CBlock> pblock(new CBlock());
+-        if (!pblock.get())
+-            return;
+-
+-        // Add our coinbase tx as first transaction
+-        pblock->vtx.push_back(txNew);
+-
+-        // Collect memory pool transactions into the block
+-        int64 nFees = 0;
+-        CRITICAL_BLOCK(cs_main)
+-        CRITICAL_BLOCK(cs_mapTransactions)
+-        {
+-            CTxDB txdb("r");
+-            map<uint256, CTxIndex> mapTestPool;
+-            vector<char> vfAlreadyAdded(mapTransactions.size());
+-            uint64 nBlockSize = 1000;
+-            int nBlockSigOps = 100;
+-            bool fFoundSomething = true;
+-            while (fFoundSomething)
+-            {
+-                fFoundSomething = false;
+-                unsigned int n = 0;
+-                for (map<uint256, CTransaction>::iterator mi = mapTransactions.begin(); mi != mapTransactions.end(); ++mi, ++n)
+-                {
+-                    if (vfAlreadyAdded[n])
+-                        continue;
+-                    CTransaction& tx = (*mi).second;
+-                    if (tx.IsCoinBase() || !tx.IsFinal())
+-                        continue;
+-                    unsigned int nTxSize = ::GetSerializeSize(tx, SER_NETWORK);
+-                    if (nBlockSize + nTxSize >= MAX_BLOCK_SIZE_GEN)
+-                        continue;
+-                    int nTxSigOps = tx.GetSigOpCount();
+-                    if (nBlockSigOps + nTxSigOps >= MAX_BLOCK_SIGOPS)
+-                        continue;
+-
+-                    // Transaction fee based on block size
+-                    int64 nMinFee = tx.GetMinFee(nBlockSize);
+-
+-                    map<uint256, CTxIndex> mapTestPoolTmp(mapTestPool);
+-                    if (!tx.ConnectInputs(txdb, mapTestPoolTmp, CDiskTxPos(1,1,1), pindexPrev, nFees, false, true, nMinFee))
+-                        continue;
+-                    swap(mapTestPool, mapTestPoolTmp);
+-
+-                    pblock->vtx.push_back(tx);
+-                    nBlockSize += nTxSize;
+-                    nBlockSigOps += nTxSigOps;
+-                    vfAlreadyAdded[n] = true;
+-                    fFoundSomething = true;
+-                }
+-            }
+-        }
+-        pblock->nBits = nBits;
+-        pblock->vtx[0].vout[0].nValue = GetBlockValue(pindexPrev->nHeight+1, nFees);
+-        printf("Running BitcoinMiner with %d transactions in block\n", pblock->vtx.size());
+-
+-
+-        //
+-        // Prebuild hash buffer
+-        //
+-        struct tmpworkspace
+-        {
+-            struct unnamed2
+-            {
+-                int nVersion;
+-                uint256 hashPrevBlock;
+-                uint256 hashMerkleRoot;
+-                unsigned int nTime;
+-                unsigned int nBits;
+-                unsigned int nNonce;
+-            }
+-            block;
+-            unsigned char pchPadding0[64];
+-            uint256 hash1;
+-            unsigned char pchPadding1[64];
+-        };
+-        char tmpbuf[sizeof(tmpworkspace)+16];
+-        tmpworkspace& tmp = *(tmpworkspace*)alignup<16>(tmpbuf);
+-
+-        tmp.block.nVersion       = pblock->nVersion;
+-        tmp.block.hashPrevBlock  = pblock->hashPrevBlock  = (pindexPrev ? pindexPrev->GetBlockHash() : 0);
+-        tmp.block.hashMerkleRoot = pblock->hashMerkleRoot = pblock->BuildMerkleTree();
+-        tmp.block.nTime          = pblock->nTime          = max((pindexPrev ? pindexPrev->GetMedianTimePast()+1 : 0), GetAdjustedTime());
+-        tmp.block.nBits          = pblock->nBits          = nBits;
+-        tmp.block.nNonce         = pblock->nNonce         = 0;
+-
+-        unsigned int nBlocks0 = FormatHashBlocks(&tmp.block, sizeof(tmp.block));
+-        unsigned int nBlocks1 = FormatHashBlocks(&tmp.hash1, sizeof(tmp.hash1));
+-
+-        // Byte swap all the input buffer
+-        for (int i = 0; i < sizeof(tmp)/4; i++)
+-            ((unsigned int*)&tmp)[i] = ByteReverse(((unsigned int*)&tmp)[i]);
+-
+-        // Precalc the first half of the first hash, which stays constant
+-        uint256 midstatebuf[2];
+-        uint256& midstate = *alignup<16>(midstatebuf);
+-        SHA256Transform(&midstate, &tmp.block, pSHA256InitState);
+-
+-
+-        //
+         // Search
+         //
+         int64 nStart = GetTime();
+-        uint256 hashTarget = CBigNum().SetCompact(pblock->nBits).getuint256();
+         uint256 hashbuf[2];
+         uint256& hash = *alignup<16>(hashbuf);
+         loop
+@@ -3098,37 +3136,13 @@
+                 if (hash <= hashTarget)
+                 {
+                     // Found a solution
+-                    pblock->nNonce = ByteReverse(nNonceFound);
+-                    assert(hash == pblock->GetHash());
++                    //// debug print
++                    printf("BitcoinMiner: \n");
++					tmp.block.nNonce = nNonceFound;
++					SetThreadPriority(THREAD_PRIORITY_NORMAL);					
++					CheckWork(tmp, extraNonce);
++					SetThreadPriority(THREAD_PRIORITY_LOWEST);
+ 
+-                        //// debug print
+-                        printf("BitcoinMiner:\n");
+-                        printf("proof-of-work found  \n  hash: %s  \ntarget: %s\n", hash.GetHex().c_str(), hashTarget.GetHex().c_str());
+-                        pblock->print();
+-                        printf("%s ", DateTimeStrFormat("%x %H:%M", GetTime()).c_str());
+-                        printf("generated %s\n", FormatMoney(pblock->vtx[0].vout[0].nValue).c_str());
+-
+-                    SetThreadPriority(THREAD_PRIORITY_NORMAL);
+-                    CRITICAL_BLOCK(cs_main)
+-                    {
+-                        if (pindexPrev == pindexBest)
+-                        {
+-                            // Save key
+-                            if (!AddKey(key))
+-                                return;
+-                            key.MakeNewKey();
+-
+-                            // Track how many getdata requests this block gets
+-                            CRITICAL_BLOCK(cs_mapRequestCount)
+-                                mapRequestCount[pblock->GetHash()] = 0;
+-
+-                            // Process this block the same as if we had received it from another node
+-                            if (!ProcessBlock(NULL, pblock.release()))
+-                                printf("ERROR in BitcoinMiner, ProcessBlock, block not accepted\n");
+-                        }
+-                    }
+-                    SetThreadPriority(THREAD_PRIORITY_LOWEST);
+-
+                     Sleep(500);
+                     break;
+                 }
+@@ -3183,8 +3197,7 @@
+                 break;
+ 
+             // Update nTime every few seconds
+-            pblock->nTime = max(pindexPrev->GetMedianTimePast()+1, GetAdjustedTime());
+-            tmp.block.nTime = ByteReverse(pblock->nTime);
++            tmp.block.nTime = ByteReverse((unsigned int)max(pindexPrev->GetMedianTimePast()+1, GetAdjustedTime()));
+         }
+     }
+ }
+Index: main.h
+===================================================================
+--- main.h	(revision 161)
++++ main.h	(working copy)
+@@ -60,6 +60,22 @@
+ 
+ 
+ 
++struct Workspace
++{
++	struct unnamed2
++	{
++		int nVersion;
++		uint256 hashPrevBlock;
++		uint256 hashMerkleRoot;
++		unsigned int nTime;
++		unsigned int nBits;
++		unsigned int nNonce;
++	}
++	block;
++	unsigned char pchPadding0[64];
++	uint256 hash1;
++	unsigned char pchPadding1[64];
++};
+ 
+ 
+ bool CheckDiskSpace(uint64 nAdditionalBytes=0);
+@@ -87,6 +103,8 @@
+ bool CheckProofOfWork(uint256 hash, unsigned int nBits);
+ bool IsInitialBlockDownload();
+ string GetWarnings(string strFor);
++void CheckWork(Workspace& workspace, CBigNum& extraNonce);
++void PrepareWork(Workspace& workspace, uint256& state, uint256& target, CBigNum& extraNonce);
+ 
+ 
+ 
+Index: rpc.cpp
+===================================================================
+--- rpc.cpp	(revision 161)
++++ rpc.cpp	(working copy)
+@@ -648,10 +648,70 @@
+     return Value::null;
+ }
+ 
++Value getwork(const Array& params, bool fHelp)
++{
++	static const short BLOCK_SIZE = 128;
++	static const short HEX_BLOCK_SIZE = BLOCK_SIZE * 2;
++	Workspace workspace;
++	uint256 state;
++	uint256 target;
++	CBigNum extraNonce = 0;
+ 
++	if (fHelp)
++        throw runtime_error(
++            "getwork\n"
++			"Input:\n"
++			"int extraNonce, String (Hex) block (256 characters)\n"
++			"If parameters are present will try to solve latest block with them\n"
++			"\n"
++            "Output:\n"
++			"String (Hex) block      - block data;\n"
++			"String (Hex) state      - already computed hash of block's first half;\n"
++			"String (Hex) target     - little endian hash target;\n"
++			"int          extraNonce - changed every time to guarantee different hash space;\n"
++			"\n"
++			"Call frequently (at ~10 seconds) to avoid searching for solution of a stale block");
+ 
++	if (vNodes.empty())
++		throw runtime_error("BitCoin is not connected!");
+ 
++	if (params.size() >= 2)
++	{
++		extraNonce.SetCompact(params[0].get_int());
++		string hexBlock = params[1].get_str();
++		if (hexBlock.length() == HEX_BLOCK_SIZE)
++		{
++			vector<unsigned char> blockData = ParseHex(hexBlock.c_str());
++			if (blockData.size() == BLOCK_SIZE)
++			{
++				for (int i = 0; i < BLOCK_SIZE; i++)
++					((unsigned char*)&workspace)[i] = blockData.at(i);
++				CheckWork(workspace, extraNonce);
++			}
++		}
++	}
++	
++	PrepareWork(workspace, state, target, extraNonce);
++	
++	char workspaceHex[HEX_BLOCK_SIZE + 1];	
++	for (int i = 0; i < BLOCK_SIZE; i++)
++		sprintf(workspaceHex + (i << 1), "%02x", ((unsigned char*)&workspace)[i]);
++		
++	char stateHex[64 + 1];	
++	for (int i = 0; i < 32; i++)
++		sprintf(stateHex + (i << 1), "%02x", ((unsigned char*)&(state))[i]);
++		
++	char targetHex[64 + 1];	
++	for (int i = 0; i < 32; i++)
++		sprintf(targetHex + (i << 1), "%02x", ((unsigned char*)&(target))[i]);
+ 
++	Object result;
++	result.push_back(Pair("block", string(workspaceHex, workspaceHex + HEX_BLOCK_SIZE)));
++	result.push_back(Pair("state", string(stateHex, stateHex + 64)));
++	result.push_back(Pair("target", string(targetHex, targetHex + 64)));
++	result.push_back(Pair("extraNonce", (int)extraNonce.GetCompact()));
++	return result;
++}
+ 
+ 
+ 
+@@ -689,6 +749,7 @@
+     make_pair("listreceivedbyaddress", &listreceivedbyaddress),
+     make_pair("listreceivedbylabel",   &listreceivedbylabel),
+     make_pair("backupwallet",          &backupwallet),
++	make_pair("getwork",          	   &getwork),
+ };
+ map<string, rpcfn_type> mapCallTable(pCallTable, pCallTable + sizeof(pCallTable)/sizeof(pCallTable[0]));
+ 
