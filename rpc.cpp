@@ -275,7 +275,7 @@ Value getnewaddress(const Array& params, bool fHelp)
         strLabel = params[0].get_str();
 
     // Generate a new key that is added to wallet
-    string strAddress = PubKeyToAddress(GenerateNewKey());
+    string strAddress = PubKeyToAddress(CWalletDB().GetKeyFromKeyPool());
 
     SetAddressBookName(strAddress, strLabel);
     return strAddress;
@@ -673,7 +673,10 @@ Value getwork(const Array& params, bool fHelp)
 			"Call frequently (at ~10 seconds) to avoid searching for solution of a stale block");
 
 	if (vNodes.empty())
-		throw runtime_error("BitCoin is not connected!");
+		throw runtime_error("Bitcoin is not connected!");
+
+	if (IsInitialBlockDownload())
+		throw runtime_error("Bitcoin is downloading blocks...");
 
 	if (params.size() >= 2)
 	{
@@ -712,7 +715,6 @@ Value getwork(const Array& params, bool fHelp)
 	result.push_back(Pair("extraNonce", (int)extraNonce.GetCompact()));
 	return result;
 }
-
 
 
 

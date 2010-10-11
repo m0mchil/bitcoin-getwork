@@ -1,14 +1,14 @@
 Index: main.cpp
 ===================================================================
---- main.cpp	(revision 161)
+--- main.cpp	(revision 163)
 +++ main.cpp	(working copy)
-@@ -2923,8 +2923,154 @@
+@@ -2915,8 +2915,147 @@
  extern unsigned int ScanHash_4WaySSE2(char* pmidstate, char* pblock, char* phash1, char* phash, unsigned int& nHashesDone);
  
  
 +CBlock* pWorkBlock = new CBlock();
-+CKey workKey;
-+CBigNum txInNonce = 0;
++CReserveKey workKey;
++CBigNum bnExtraNonce = 0;
 +unsigned int nsTransactionsUpdatedLast;
 +CCriticalSection work;
 +void CheckWork(Workspace& tmp, CBigNum& extraNonce)
@@ -35,40 +35,28 @@ Index: main.cpp
 +                printf("proof-of-work found  \n  hash: %s  \ntarget: %s\n", hash.GetHex().c_str(), hashTarget.GetHex().c_str());
 +                pBlock->print();
 +                printf("%s ", DateTimeStrFormat("%x %H:%M", GetTime()).c_str());
-+                printf("generated %s\n", FormatMoney(pBlock->vtx[0].vout[0].nValue).c_str());
-+				
-+				if (AddKey(workKey))
-+				{
-+					workKey.MakeNewKey();
++                printf("generated %s\n", FormatMoney(pBlock->vtx[0].vout[0].nValue).c_str());				
  
-+					CRITICAL_BLOCK(cs_mapRequestCount)
-+						mapRequestCount[pWorkBlock->GetHash()] = 0;
-+					if (!ProcessBlock(NULL, pBlock))
-+					{					
-+						printf("ERROR in CheckWork, ProcessBlock, block not accepted\n");
-+					}
-+				}
-+				else
-+				{
-+					printf("ERROR in CheckWork, AddKey failed\n");
++				workKey.KeepKey();
+ 
++				CRITICAL_BLOCK(cs_mapRequestCount)
++					mapRequestCount[pWorkBlock->GetHash()] = 0;
++				if (!ProcessBlock(NULL, pBlock))
++				{					
++					printf("ERROR in CheckWork, ProcessBlock, block not accepted\n");
 +				}
 +			}
 +		}
 +	}
 +}
- 
++
 +void PrepareWork(Workspace& workspace, uint256& state, uint256& target, CBigNum& extraNonce)
 +{
 +	CRITICAL_BLOCK(work)
 +	{
-+		if (workKey.IsNull())
-+		{
-+			workKey.MakeNewKey();
-+		}
-+
 +		CBlockIndex* pIndexPrev = pindexBest;
 +		unsigned int nBits = GetNextWorkRequired(pIndexPrev);
-+		extraNonce = ++txInNonce;	
++		extraNonce = ++bnExtraNonce;	
 +		if (nTransactionsUpdated != nsTransactionsUpdatedLast || pWorkBlock->hashPrevBlock != pIndexPrev->GetBlockHash())
 +		{
 +			nsTransactionsUpdatedLast = nTransactionsUpdated;
@@ -79,7 +67,7 @@ Index: main.cpp
 +			txNew.vin.resize(1);
 +			txNew.vin[0].prevout.SetNull();
 +			txNew.vout.resize(1);
-+			txNew.vout[0].scriptPubKey << workKey.GetPubKey() << OP_CHECKSIG;
++			txNew.vout[0].scriptPubKey << workKey.GetReservedKey() << OP_CHECKSIG;
 +			pWorkBlock->vtx.push_back(txNew);
 +
 +			int64 nFees = 0;
@@ -133,14 +121,19 @@ Index: main.cpp
 +		}
 +		
 +		pWorkBlock->vtx[0].vin[0].scriptSig.clear();
-+		pWorkBlock->vtx[0].vin[0].scriptSig << nBits << txInNonce;
++		pWorkBlock->vtx[0].vin[0].scriptSig << nBits << bnExtraNonce;
 +
 +		workspace.block.nVersion       = pWorkBlock->nVersion;
 +		workspace.block.hashPrevBlock  = pWorkBlock->hashPrevBlock;
 +		workspace.block.hashMerkleRoot = pWorkBlock->hashMerkleRoot        = pWorkBlock->BuildMerkleTree();
-+		workspace.block.nTime          = max((pIndexPrev ? pIndexPrev->GetMedianTimePast()+1 : 0), GetAdjustedTime());
 +		workspace.block.nBits          = pWorkBlock->nBits;
 +		workspace.block.nNonce         = 0;
++
++		// Update nTime
++		int64 nNewTime = max(pIndexPrev->GetMedianTimePast()+1, GetAdjustedTime());
++		if (nNewTime != pWorkBlock->nTime && bnExtraNonce > 10)
++			bnExtraNonce = 0;
++		workspace.block.nTime = pWorkBlock->nTime = nNewTime;
 +
 +		unsigned int nBlocks0 = FormatHashBlocks(&workspace.block, sizeof(workspace.block));
 +		unsigned int nBlocks1 = FormatHashBlocks(&workspace.hash1, sizeof(workspace.hash1));
@@ -157,14 +150,13 @@ Index: main.cpp
  void BitcoinMiner()
  {
      printf("BitcoinMiner started\n");
-@@ -2933,9 +3079,12 @@
+@@ -2925,8 +3064,12 @@
      if (mapArgs.count("-4way"))
          f4WaySSE2 = (mapArgs["-4way"] != "0");
  
--    CKey key;
--    key.MakeNewKey();
+-    CReserveKey reservekey;
 -    CBigNum bnExtraNonce = 0;
-+    CBigNum extraNonce;
++	CBigNum extraNonce;
 +	uint256 midstatebuf2[2];
 +	uint256& midstate = *alignup<16>(midstatebuf2);	
 +	char tmpbuf2[sizeof(Workspace)+16];
@@ -173,7 +165,7 @@ Index: main.cpp
      while (fGenerateBitcoins)
      {
          Sleep(50);
-@@ -2952,127 +3101,16 @@
+@@ -2943,127 +3086,16 @@
  
          unsigned int nTransactionsUpdatedLast = nTransactionsUpdated;
          CBlockIndex* pindexPrev = pindexBest;
@@ -189,9 +181,9 @@ Index: main.cpp
 -        CTransaction txNew;
 -        txNew.vin.resize(1);
 -        txNew.vin[0].prevout.SetNull();
--        txNew.vin[0].scriptSig << nBits << ++bnExtraNonce;
+-        txNew.vin[0].scriptSig << ++bnExtraNonce;
 -        txNew.vout.resize(1);
--        txNew.vout[0].scriptPubKey << key.GetPubKey() << OP_CHECKSIG;
+-        txNew.vout[0].scriptPubKey << reservekey.GetReservedKey() << OP_CHECKSIG;
  
 -
          //
@@ -304,7 +296,7 @@ Index: main.cpp
          uint256 hashbuf[2];
          uint256& hash = *alignup<16>(hashbuf);
          loop
-@@ -3098,37 +3136,13 @@
+@@ -3089,35 +3121,13 @@
                  if (hash <= hashTarget)
                  {
                      // Found a solution
@@ -329,10 +321,8 @@ Index: main.cpp
 -                    {
 -                        if (pindexPrev == pindexBest)
 -                        {
--                            // Save key
--                            if (!AddKey(key))
--                                return;
--                            key.MakeNewKey();
+-                            // Remove key from key pool
+-                            reservekey.KeepKey();
 -
 -                            // Track how many getdata requests this block gets
 -                            CRITICAL_BLOCK(cs_mapRequestCount)
@@ -348,11 +338,14 @@ Index: main.cpp
                      Sleep(500);
                      break;
                  }
-@@ -3183,8 +3197,7 @@
+@@ -3172,11 +3182,7 @@
                  break;
  
              // Update nTime every few seconds
--            pblock->nTime = max(pindexPrev->GetMedianTimePast()+1, GetAdjustedTime());
+-            int64 nNewTime = max(pindexPrev->GetMedianTimePast()+1, GetAdjustedTime());
+-            if (nNewTime != pblock->nTime && bnExtraNonce > 10)
+-                bnExtraNonce = 0;
+-            pblock->nTime = nNewTime;
 -            tmp.block.nTime = ByteReverse(pblock->nTime);
 +            tmp.block.nTime = ByteReverse((unsigned int)max(pindexPrev->GetMedianTimePast()+1, GetAdjustedTime()));
          }
@@ -360,7 +353,7 @@ Index: main.cpp
  }
 Index: main.h
 ===================================================================
---- main.h	(revision 161)
+--- main.h	(revision 163)
 +++ main.h	(working copy)
 @@ -60,6 +60,22 @@
  
@@ -396,9 +389,9 @@ Index: main.h
  
 Index: rpc.cpp
 ===================================================================
---- rpc.cpp	(revision 161)
+--- rpc.cpp	(revision 163)
 +++ rpc.cpp	(working copy)
-@@ -648,10 +648,70 @@
+@@ -648,11 +648,73 @@
      return Value::null;
  }
  
@@ -427,7 +420,10 @@ Index: rpc.cpp
 +			"Call frequently (at ~10 seconds) to avoid searching for solution of a stale block");
  
 +	if (vNodes.empty())
-+		throw runtime_error("BitCoin is not connected!");
++		throw runtime_error("Bitcoin is not connected!");
+ 
++	if (IsInitialBlockDownload())
++		throw runtime_error("Bitcoin is downloading blocks...");
  
 +	if (params.size() >= 2)
 +	{
@@ -469,7 +465,7 @@ Index: rpc.cpp
  
  
  
-@@ -689,6 +749,7 @@
+@@ -689,6 +751,7 @@
      make_pair("listreceivedbyaddress", &listreceivedbyaddress),
      make_pair("listreceivedbylabel",   &listreceivedbylabel),
      make_pair("backupwallet",          &backupwallet),

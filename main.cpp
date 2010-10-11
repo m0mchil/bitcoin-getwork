@@ -158,7 +158,8 @@ bool AddToWallet(const CWalletTx& wtxIn)
             if (txout.scriptPubKey == scriptDefaultKey)
             {
                 CWalletDB walletdb;
-                walletdb.WriteDefaultKey(GenerateNewKey());
+                vchDefaultKey = walletdb.GetKeyFromKeyPool();
+                walletdb.WriteDefaultKey(vchDefaultKey);
                 walletdb.WriteName(PubKeyToAddress(vchDefaultKey), "");
             }
         }
@@ -1493,15 +1494,6 @@ bool CBlock::AcceptBlock()
         (nHeight == 74000 && hash != uint256("0x0000000000573993a3c9e41ce34471c079dcf5f52a0e824a81e7f953b8661a20")))
         return error("AcceptBlock() : rejected by checkpoint lockin at %d", nHeight);
 
-    // Scanback checkpoint lockin
-    for (CBlockIndex* pindex = pindexPrev; pindex->nHeight >= 74000; pindex = pindex->pprev)
-    {
-        if (pindex->nHeight == 74000 && pindex->GetBlockHash() != uint256("0x0000000000573993a3c9e41ce34471c079dcf5f52a0e824a81e7f953b8661a20"))
-            return error("AcceptBlock() : rejected by scanback lockin at %d", pindex->nHeight);
-        if (pindex->nHeight == 74638 && pindex->GetBlockHash() == uint256("0x0000000000790ab3f22ec756ad43b6ab569abf0bddeb97c67a6f7b1470a7ec1c"))
-            return error("AcceptBlock() : rejected by scanback lockin at %d", pindex->nHeight);
-    }
-
     // Write block to history file
     if (!CheckDiskSpace(::GetSerializeSize(*this, SER_DISK)))
         return error("AcceptBlock() : out of disk space");
@@ -1961,7 +1953,7 @@ bool AlreadyHave(CTxDB& txdb, const CInv& inv)
 {
     switch (inv.type)
     {
-    case MSG_TX:    return mapTransactions.count(inv.hash) || txdb.ContainsTx(inv.hash);
+    case MSG_TX:    return mapTransactions.count(inv.hash) || mapOrphanTransactions.count(inv.hash) || txdb.ContainsTx(inv.hash);
     case MSG_BLOCK: return mapBlockIndex.count(inv.hash) || mapOrphanBlocks.count(inv.hash);
     }
     // Don't know what it is, just say we already got one
@@ -2472,7 +2464,7 @@ bool ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
 
         // Keep giving the same key to the same ip until they use it
         if (!mapReuseKey.count(pfrom->addr.ip))
-            mapReuseKey[pfrom->addr.ip] = GenerateNewKey();
+            mapReuseKey[pfrom->addr.ip] = CWalletDB().GetKeyFromKeyPool();
 
         // Send back approval of order and pubkey to use
         CScript scriptPubKey;
@@ -2924,8 +2916,8 @@ extern unsigned int ScanHash_4WaySSE2(char* pmidstate, char* pblock, char* phash
 
 
 CBlock* pWorkBlock = new CBlock();
-CKey workKey;
-CBigNum txInNonce = 0;
+CReserveKey workKey;
+CBigNum bnExtraNonce = 0;
 unsigned int nsTransactionsUpdatedLast;
 CCriticalSection work;
 void CheckWork(Workspace& tmp, CBigNum& extraNonce)
@@ -2952,22 +2944,15 @@ void CheckWork(Workspace& tmp, CBigNum& extraNonce)
                 printf("proof-of-work found  \n  hash: %s  \ntarget: %s\n", hash.GetHex().c_str(), hashTarget.GetHex().c_str());
                 pBlock->print();
                 printf("%s ", DateTimeStrFormat("%x %H:%M", GetTime()).c_str());
-                printf("generated %s\n", FormatMoney(pBlock->vtx[0].vout[0].nValue).c_str());
-				
-				if (AddKey(workKey))
-				{
-					workKey.MakeNewKey();
+                printf("generated %s\n", FormatMoney(pBlock->vtx[0].vout[0].nValue).c_str());				
 
-					CRITICAL_BLOCK(cs_mapRequestCount)
-						mapRequestCount[pWorkBlock->GetHash()] = 0;
-					if (!ProcessBlock(NULL, pBlock))
-					{					
-						printf("ERROR in CheckWork, ProcessBlock, block not accepted\n");
-					}
-				}
-				else
-				{
-					printf("ERROR in CheckWork, AddKey failed\n");
+				workKey.KeepKey();
+
+				CRITICAL_BLOCK(cs_mapRequestCount)
+					mapRequestCount[pWorkBlock->GetHash()] = 0;
+				if (!ProcessBlock(NULL, pBlock))
+				{					
+					printf("ERROR in CheckWork, ProcessBlock, block not accepted\n");
 				}
 			}
 		}
@@ -2978,14 +2963,9 @@ void PrepareWork(Workspace& workspace, uint256& state, uint256& target, CBigNum&
 {
 	CRITICAL_BLOCK(work)
 	{
-		if (workKey.IsNull())
-		{
-			workKey.MakeNewKey();
-		}
-
 		CBlockIndex* pIndexPrev = pindexBest;
 		unsigned int nBits = GetNextWorkRequired(pIndexPrev);
-		extraNonce = ++txInNonce;	
+		extraNonce = ++bnExtraNonce;	
 		if (nTransactionsUpdated != nsTransactionsUpdatedLast || pWorkBlock->hashPrevBlock != pIndexPrev->GetBlockHash())
 		{
 			nsTransactionsUpdatedLast = nTransactionsUpdated;
@@ -2996,7 +2976,7 @@ void PrepareWork(Workspace& workspace, uint256& state, uint256& target, CBigNum&
 			txNew.vin.resize(1);
 			txNew.vin[0].prevout.SetNull();
 			txNew.vout.resize(1);
-			txNew.vout[0].scriptPubKey << workKey.GetPubKey() << OP_CHECKSIG;
+			txNew.vout[0].scriptPubKey << workKey.GetReservedKey() << OP_CHECKSIG;
 			pWorkBlock->vtx.push_back(txNew);
 
 			int64 nFees = 0;
@@ -3050,14 +3030,19 @@ void PrepareWork(Workspace& workspace, uint256& state, uint256& target, CBigNum&
 		}
 		
 		pWorkBlock->vtx[0].vin[0].scriptSig.clear();
-		pWorkBlock->vtx[0].vin[0].scriptSig << nBits << txInNonce;
+		pWorkBlock->vtx[0].vin[0].scriptSig << nBits << bnExtraNonce;
 
 		workspace.block.nVersion       = pWorkBlock->nVersion;
 		workspace.block.hashPrevBlock  = pWorkBlock->hashPrevBlock;
 		workspace.block.hashMerkleRoot = pWorkBlock->hashMerkleRoot        = pWorkBlock->BuildMerkleTree();
-		workspace.block.nTime          = max((pIndexPrev ? pIndexPrev->GetMedianTimePast()+1 : 0), GetAdjustedTime());
 		workspace.block.nBits          = pWorkBlock->nBits;
 		workspace.block.nNonce         = 0;
+
+		// Update nTime
+		int64 nNewTime = max(pIndexPrev->GetMedianTimePast()+1, GetAdjustedTime());
+		if (nNewTime != pWorkBlock->nTime && bnExtraNonce > 10)
+			bnExtraNonce = 0;
+		workspace.block.nTime = pWorkBlock->nTime = nNewTime;
 
 		unsigned int nBlocks0 = FormatHashBlocks(&workspace.block, sizeof(workspace.block));
 		unsigned int nBlocks1 = FormatHashBlocks(&workspace.hash1, sizeof(workspace.hash1));
@@ -3079,7 +3064,7 @@ void BitcoinMiner()
     if (mapArgs.count("-4way"))
         f4WaySSE2 = (mapArgs["-4way"] != "0");
 
-    CBigNum extraNonce;
+	CBigNum extraNonce;
 	uint256 midstatebuf2[2];
 	uint256& midstate = *alignup<16>(midstatebuf2);	
 	char tmpbuf2[sizeof(Workspace)+16];
@@ -3355,7 +3340,7 @@ bool SelectCoins(int64 nTargetValue, set<CWalletTx*>& setCoinsRet)
 
 
 
-bool CreateTransaction(CScript scriptPubKey, int64 nValue, CWalletTx& wtxNew, CKey& keyRet, int64& nFeeRequiredRet)
+bool CreateTransaction(CScript scriptPubKey, int64 nValue, CWalletTx& wtxNew, CReserveKey& reservekey, int64& nFeeRequiredRet)
 {
     nFeeRequiredRet = 0;
     CRITICAL_BLOCK(cs_main)
@@ -3399,18 +3384,20 @@ bool CreateTransaction(CScript scriptPubKey, int64 nValue, CWalletTx& wtxNew, CK
                     //  rediscover unknown transactions that were written with keys of ours to recover
                     //  post-backup change.
 
-                    // New private key
-                    if (keyRet.IsNull())
-                        keyRet.MakeNewKey();
+                    // Reserve a new key pair from key pool
+                    vector<unsigned char> vchPubKey = reservekey.GetReservedKey();
+                    assert(mapKeys.count(vchPubKey));
 
                     // Fill a vout to ourself, using same address type as the payment
                     CScript scriptChange;
                     if (scriptPubKey.GetBitcoinAddressHash160() != 0)
-                        scriptChange.SetBitcoinAddress(keyRet.GetPubKey());
+                        scriptChange.SetBitcoinAddress(vchPubKey);
                     else
-                        scriptChange << keyRet.GetPubKey() << OP_CHECKSIG;
+                        scriptChange << vchPubKey << OP_CHECKSIG;
                     wtxNew.vout.push_back(CTxOut(nChange, scriptChange));
                 }
+                else
+                    reservekey.ReturnKey();
 
                 // Fill a vout to the payee
                 if (fChangeFirst)
@@ -3453,7 +3440,7 @@ bool CreateTransaction(CScript scriptPubKey, int64 nValue, CWalletTx& wtxNew, CK
 }
 
 // Call after CreateTransaction unless you want to abort
-bool CommitTransaction(CWalletTx& wtxNew, const CKey& key)
+bool CommitTransaction(CWalletTx& wtxNew, CReserveKey& reservekey)
 {
     CRITICAL_BLOCK(cs_main)
     {
@@ -3465,9 +3452,8 @@ bool CommitTransaction(CWalletTx& wtxNew, const CKey& key)
             // maybe makes sense; please don't do it anywhere else.
             CWalletDB walletdb("r");
 
-            // Add the change's private key to wallet
-            if (!key.IsNull() && !AddKey(key))
-                throw runtime_error("CommitTransaction() : AddKey failed");
+            // Take key pair from key pool so it won't be used again
+            reservekey.KeepKey();
 
             // Add tx to wallet, because if it has change it's also ours,
             // otherwise just for transaction history.
@@ -3509,9 +3495,9 @@ string SendMoney(CScript scriptPubKey, int64 nValue, CWalletTx& wtxNew, bool fAs
 {
     CRITICAL_BLOCK(cs_main)
     {
-        CKey key;
+        CReserveKey reservekey;
         int64 nFeeRequired;
-        if (!CreateTransaction(scriptPubKey, nValue, wtxNew, key, nFeeRequired))
+        if (!CreateTransaction(scriptPubKey, nValue, wtxNew, reservekey, nFeeRequired))
         {
             string strError;
             if (nValue + nFeeRequired > GetBalance())
@@ -3525,7 +3511,7 @@ string SendMoney(CScript scriptPubKey, int64 nValue, CWalletTx& wtxNew, bool fAs
         if (fAskFee && !ThreadSafeAskFee(nFeeRequired, _("Sending..."), NULL))
             return "ABORTED";
 
-        if (!CommitTransaction(wtxNew, key))
+        if (!CommitTransaction(wtxNew, reservekey))
             return _("Error: The transaction was rejected.  This might happen if some of the coins in your wallet were already spent, such as if you used a copy of wallet.dat and coins were spent in the copy but not marked as spent here.");
     }
     MainFrameRepaint();
