@@ -2930,35 +2930,36 @@ void CheckWork(Workspace& tmp, CBigNum& extraNonce)
 	CRITICAL_BLOCK(work)
 	CRITICAL_BLOCK(cs_main)
 	{
+		if (pWorkBlock->hashPrevBlock != pindexBest->GetBlockHash())
+			return;
 		for (int i = 0; i < sizeof(tmp)/4; i++)
-			((unsigned int*)&tmp)[i] = ByteReverse(((unsigned int*)&tmp)[i]);
-		if (tmp.block.hashPrevBlock != 0 && tmp.block.hashPrevBlock == pWorkBlock->hashPrevBlock)
+			((unsigned int*)&tmp)[i] = ByteReverse(((unsigned int*)&tmp)[i]);		
+		if (tmp.block.hashPrevBlock == 0 || tmp.block.hashPrevBlock != pWorkBlock->hashPrevBlock)
+			return;
+		CBlock* pBlock = new CBlock(); // released in ProcessBlock
+		*pBlock = *pWorkBlock;
+		pBlock->nTime = tmp.block.nTime;
+		pBlock->nNonce = tmp.block.nNonce;
+		pBlock->vtx[0].vin[0].scriptSig.clear();
+		pBlock->vtx[0].vin[0].scriptSig << GetNextWorkRequired(pindexBest) << extraNonce;
+		pBlock->hashMerkleRoot = pBlock->BuildMerkleTree();
+		uint256 hash = pBlock->GetHash();
+		uint256 hashTarget = CBigNum().SetCompact(pWorkBlock->nBits).getuint256();
+		if (hash <= hashTarget)
 		{
-			CBlock* pBlock = new CBlock(); // released in ProcessBlock
-			*pBlock = *pWorkBlock;
-			pBlock->nTime = tmp.block.nTime;
-			pBlock->nNonce = tmp.block.nNonce;
-			pBlock->vtx[0].vin[0].scriptSig.clear();
-			pBlock->vtx[0].vin[0].scriptSig << GetNextWorkRequired(pindexBest) << extraNonce;
-			pBlock->hashMerkleRoot = pBlock->BuildMerkleTree();
-			uint256 hash = pBlock->GetHash();
-			uint256 hashTarget = CBigNum().SetCompact(pWorkBlock->nBits).getuint256();
-			if (hash <= hashTarget)
-			{
-				//// debug print
-                printf("proof-of-work found  \n  hash: %s  \ntarget: %s\n", hash.GetHex().c_str(), hashTarget.GetHex().c_str());
-                pBlock->print();
-                printf("%s ", DateTimeStrFormat("%x %H:%M", GetTime()).c_str());
-                printf("generated %s\n", FormatMoney(pBlock->vtx[0].vout[0].nValue).c_str());				
+			//// debug print
+			printf("proof-of-work found  \n  hash: %s  \ntarget: %s\n", hash.GetHex().c_str(), hashTarget.GetHex().c_str());
+			pBlock->print();
+			printf("%s ", DateTimeStrFormat("%x %H:%M", GetTime()).c_str());
+			printf("generated %s\n", FormatMoney(pBlock->vtx[0].vout[0].nValue).c_str());				
 
-				workKey.KeepKey();
+			workKey.KeepKey();
 
-				CRITICAL_BLOCK(cs_mapRequestCount)
-					mapRequestCount[pWorkBlock->GetHash()] = 0;
-				if (!ProcessBlock(NULL, pBlock))
-				{					
-					printf("ERROR in CheckWork, ProcessBlock, block not accepted\n");
-				}
+			CRITICAL_BLOCK(cs_mapRequestCount)
+				mapRequestCount[pWorkBlock->GetHash()] = 0;
+			if (!ProcessBlock(NULL, pBlock))
+			{					
+				printf("ERROR in CheckWork, ProcessBlock, block not accepted\n");
 			}
 		}
 	}
