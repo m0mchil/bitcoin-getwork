@@ -654,6 +654,29 @@ Value backupwallet(const Array& params, bool fHelp)
     return Value::null;
 }
 
+Value validateaddress(const Array& params, bool fHelp)
+{
+    if (fHelp || params.size() != 1)
+        throw runtime_error(
+            "validateaddress <bitcoinaddress>\n"
+            "Return information about <bitcoinaddress>.");
+
+    string strAddress = params[0].get_str();
+    uint160 hash160;
+    bool isValid = AddressToHash160(strAddress, hash160);
+
+    Object ret;
+    ret.push_back(Pair("isvalid", isValid));
+    if (isValid)
+    {
+        // Call Hash160ToAddress() so we always return current ADDRESSVERSION
+        // version of the address:
+        ret.push_back(Pair("address", Hash160ToAddress(hash160)));
+        ret.push_back(Pair("ismine", (mapPubKeys.count(hash160) > 0)));
+    }
+    return ret;
+}
+
 Value getwork(const Array& params, bool fHelp)
 {
 	static const short BLOCK_SIZE = 128;
@@ -661,7 +684,7 @@ Value getwork(const Array& params, bool fHelp)
 	Workspace workspace;
 	uint256 state;
 	uint256 target;
-	CBigNum extraNonce = 0;
+	unsigned int extraNonce = 0;
 
 	if (fHelp)
         throw runtime_error(
@@ -686,7 +709,7 @@ Value getwork(const Array& params, bool fHelp)
 
 	if (params.size() >= 2)
 	{
-		extraNonce.SetCompact(params[0].get_int());
+		extraNonce = params[0].get_int();
 		string hexBlock = params[1].get_str();
 		if (hexBlock.length() == HEX_BLOCK_SIZE)
 		{
@@ -718,9 +741,13 @@ Value getwork(const Array& params, bool fHelp)
 	result.push_back(Pair("block", string(workspaceHex, workspaceHex + HEX_BLOCK_SIZE)));
 	result.push_back(Pair("state", string(stateHex, stateHex + 64)));
 	result.push_back(Pair("target", string(targetHex, targetHex + 64)));
-	result.push_back(Pair("extraNonce", (int)extraNonce.GetCompact()));
+	result.push_back(Pair("extraNonce", (int)extraNonce));
 	return result;
 }
+
+
+
+
 
 
 
@@ -757,6 +784,7 @@ pair<string, rpcfn_type> pCallTable[] =
     make_pair("listreceivedbyaddress", &listreceivedbyaddress),
     make_pair("listreceivedbylabel",   &listreceivedbylabel),
     make_pair("backupwallet",          &backupwallet),
+    make_pair("validateaddress",       &validateaddress),
 	make_pair("getwork",          	   &getwork),
 };
 map<string, rpcfn_type> mapCallTable(pCallTable, pCallTable + sizeof(pCallTable)/sizeof(pCallTable[0]));
@@ -778,6 +806,7 @@ string pAllowInSafeMode[] =
     "getlabel",
     "getaddressesbylabel",
     "backupwallet",
+    "validateaddress",
 };
 set<string> setAllowInSafeMode(pAllowInSafeMode, pAllowInSafeMode + sizeof(pAllowInSafeMode)/sizeof(pAllowInSafeMode[0]));
 

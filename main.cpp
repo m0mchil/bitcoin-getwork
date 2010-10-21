@@ -21,7 +21,8 @@ unsigned int nTransactionsUpdated = 0;
 map<COutPoint, CInPoint> mapNextTx;
 
 map<uint256, CBlockIndex*> mapBlockIndex;
-const uint256 hashGenesisBlock("0x000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f");
+uint256 hashGenesisBlock("0x000000000019d6689c085ae165831e934ff763ae46a2a6c172b3f1b60a8ce26f");
+CBigNum bnProofOfWorkLimit(~uint256(0) >> 32);
 CBlockIndex* pindexGenesisBlock = NULL;
 int nBestHeight = -1;
 CBigNum bnBestChainWork = 0;
@@ -1487,12 +1488,13 @@ bool CBlock::AcceptBlock()
             return error("AcceptBlock() : contains a non-final transaction");
 
     // Check that the block chain matches the known block chain up to a checkpoint
-    if ((nHeight == 11111 && hash != uint256("0x0000000069e244f73d78e8fd29ba2fd2ed618bd6fa2ee92559f542fdb26e7c1d")) ||
-        (nHeight == 33333 && hash != uint256("0x000000002dd5588a74784eaa7ab0507a18ad16a236e7b1ce69f00d7ddfb5d0a6")) ||
-        (nHeight == 68555 && hash != uint256("0x00000000001e1b4903550a0b96e9a9405c8a95f387162e4944e8d9fbe501cd6a")) ||
-        (nHeight == 70567 && hash != uint256("0x00000000006a49b14bcf27462068f1264c961f11fa2e0eddd2be0791e1d4124a")) ||
-        (nHeight == 74000 && hash != uint256("0x0000000000573993a3c9e41ce34471c079dcf5f52a0e824a81e7f953b8661a20")))
-        return error("AcceptBlock() : rejected by checkpoint lockin at %d", nHeight);
+    if (!fTestNet)
+        if ((nHeight == 11111 && hash != uint256("0x0000000069e244f73d78e8fd29ba2fd2ed618bd6fa2ee92559f542fdb26e7c1d")) ||
+            (nHeight == 33333 && hash != uint256("0x000000002dd5588a74784eaa7ab0507a18ad16a236e7b1ce69f00d7ddfb5d0a6")) ||
+            (nHeight == 68555 && hash != uint256("0x00000000001e1b4903550a0b96e9a9405c8a95f387162e4944e8d9fbe501cd6a")) ||
+            (nHeight == 70567 && hash != uint256("0x00000000006a49b14bcf27462068f1264c961f11fa2e0eddd2be0791e1d4124a")) ||
+            (nHeight == 74000 && hash != uint256("0x0000000000573993a3c9e41ce34471c079dcf5f52a0e824a81e7f953b8661a20")))
+            return error("AcceptBlock() : rejected by checkpoint lockin at %d", nHeight);
 
     // Write block to history file
     if (!CheckDiskSpace(::GetSerializeSize(*this, SER_DISK)))
@@ -1683,6 +1685,16 @@ FILE* AppendBlockFile(unsigned int& nFileRet)
 
 bool LoadBlockIndex(bool fAllowNew)
 {
+    if (fTestNet)
+    {
+        hashGenesisBlock = uint256("0x0000000224b1593e3ff16a0e3b61285bbc393a39f78c8aa48c456142671f7110");
+        bnProofOfWorkLimit = CBigNum(~uint256(0) >> 28);
+        pchMessageStart[0] = 0xfa;
+        pchMessageStart[1] = 0xbf;
+        pchMessageStart[2] = 0xb5;
+        pchMessageStart[3] = 0xda;
+    }
+
     //
     // Load block index
     //
@@ -1723,13 +1735,19 @@ bool LoadBlockIndex(bool fAllowNew)
         block.nBits    = 0x1d00ffff;
         block.nNonce   = 2083236893;
 
-            //// debug print
-            printf("%s\n", block.GetHash().ToString().c_str());
-            printf("%s\n", hashGenesisBlock.ToString().c_str());
-            printf("%s\n", block.hashMerkleRoot.ToString().c_str());
-            assert(block.hashMerkleRoot == uint256("0x4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b"));
-            block.print();
+        if (fTestNet)
+        {
+            block.nTime    = 1279232055;
+            block.nBits    = 0x1d07fff8;
+            block.nNonce   = 81622180;
+        }
 
+        //// debug print
+        printf("%s\n", block.GetHash().ToString().c_str());
+        printf("%s\n", hashGenesisBlock.ToString().c_str());
+        printf("%s\n", block.hashMerkleRoot.ToString().c_str());
+        assert(block.hashMerkleRoot == uint256("0x4a5e1e4baab89f3a32518a88c31bc87f618f76673e2cc77ab2127b7afdeda33b"));
+        block.print();
         assert(block.GetHash() == hashGenesisBlock);
 
         // Start new block file
@@ -1963,7 +1981,10 @@ bool AlreadyHave(CTxDB& txdb, const CInv& inv)
 
 
 
-
+// The message start string is designed to be unlikely to occur in normal data.
+// The characters are rarely used upper ascii, not valid as UTF-8, and produce
+// a large 4-byte int at any alignment.
+char pchMessageStart[4] = { 0xf9, 0xbe, 0xb4, 0xd9 };
 
 
 bool ProcessMessages(CNode* pfrom)
@@ -2022,19 +2043,14 @@ bool ProcessMessages(CNode* pfrom)
         if (nMessageSize > vRecv.size())
         {
             // Rewind and wait for rest of message
-            ///// need a mechanism to give up waiting for overlong message size error
             vRecv.insert(vRecv.begin(), vHeaderSave.begin(), vHeaderSave.end());
             break;
         }
 
-        // Copy message to its own buffer
-        CDataStream vMsg(vRecv.begin(), vRecv.begin() + nMessageSize, vRecv.nType, vRecv.nVersion);
-        vRecv.ignore(nMessageSize);
-
         // Checksum
         if (vRecv.GetVersion() >= 209)
         {
-            uint256 hash = Hash(vMsg.begin(), vMsg.end());
+            uint256 hash = Hash(vRecv.begin(), vRecv.begin() + nMessageSize);
             unsigned int nChecksum = 0;
             memcpy(&nChecksum, &hash, sizeof(nChecksum));
             if (nChecksum != hdr.nChecksum)
@@ -2044,6 +2060,10 @@ bool ProcessMessages(CNode* pfrom)
                 continue;
             }
         }
+
+        // Copy message to its own buffer
+        CDataStream vMsg(vRecv.begin(), vRecv.begin() + nMessageSize, vRecv.nType, vRecv.nVersion);
+        vRecv.ignore(nMessageSize);
 
         // Process message
         bool fRet = false;
@@ -2208,20 +2228,27 @@ bool ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
                 addr.nTime -= 5 * 24 * 60 * 60;
             AddAddress(addr);
             pfrom->AddAddressKnown(addr);
-            if (!pfrom->fGetAddr && addr.IsRoutable())
+            if (!pfrom->fGetAddr && vAddr.size() <= 10 && addr.IsRoutable())
             {
                 // Relay to a limited number of other nodes
                 CRITICAL_BLOCK(cs_vNodes)
                 {
-                    // Use deterministic randomness to send to
-                    // the same places for 12 hours at a time
+                    // Use deterministic randomness to send to the same nodes for 24 hours
+                    // at a time so the setAddrKnowns of the chosen nodes prevent repeats
                     static uint256 hashSalt;
                     if (hashSalt == 0)
                         RAND_bytes((unsigned char*)&hashSalt, sizeof(hashSalt));
-                    uint256 hashRand = addr.ip ^ ((GetTime()+addr.ip)/(12*60*60)) ^ hashSalt;
+                    uint256 hashRand = hashSalt ^ (((int64)addr.ip)<<32) ^ ((GetTime()+addr.ip)/(24*60*60));
+                    hashRand = Hash(BEGIN(hashRand), END(hashRand));
                     multimap<uint256, CNode*> mapMix;
                     foreach(CNode* pnode, vNodes)
-                        mapMix.insert(make_pair(hashRand = Hash(BEGIN(hashRand), END(hashRand)), pnode));
+                    {
+                        unsigned int nPointer;
+                        memcpy(&nPointer, &pnode, sizeof(nPointer));
+                        uint256 hashKey = hashRand ^ nPointer;
+                        hashKey = Hash(BEGIN(hashKey), END(hashKey));
+                        mapMix.insert(make_pair(hashKey, pnode));
+                    }
                     int nRelayNodes = 2;
                     for (multimap<uint256, CNode*>::iterator mi = mapMix.begin(); mi != mapMix.end() && nRelayNodes-- > 0; ++mi)
                         ((*mi).second)->PushAddress(addr);
@@ -2446,7 +2473,7 @@ bool ProcessMessage(CNode* pfrom, string strCommand, CDataStream& vRecv)
             foreach(const PAIRTYPE(vector<unsigned char>, CAddress)& item, mapAddresses)
             {
                 const CAddress& addr = item.second;
-                if (addr.nTime > nSince && GetRand(nCount) < 2000)
+                if (addr.nTime > nSince && GetRand(nCount) < 2500)
                     pfrom->PushAddress(addr);
             }
         }
@@ -2922,10 +2949,11 @@ extern unsigned int ScanHash_4WaySSE2(char* pmidstate, char* pblock, char* phash
 
 CBlock* pWorkBlock = new CBlock();
 CReserveKey workKey;
-CBigNum bnExtraNonce = 0;
+unsigned int nExtraNonce = 0;
+int64 nPrevTime = 0;
 unsigned int nsTransactionsUpdatedLast;
 CCriticalSection work;
-void CheckWork(Workspace& tmp, CBigNum& extraNonce)
+void CheckWork(Workspace& tmp, unsigned int& extraNonce)
 {
 	CRITICAL_BLOCK(work)
 	CRITICAL_BLOCK(cs_main)
@@ -2941,37 +2969,35 @@ void CheckWork(Workspace& tmp, CBigNum& extraNonce)
 		pBlock->nTime = tmp.block.nTime;
 		pBlock->nNonce = tmp.block.nNonce;
 		pBlock->vtx[0].vin[0].scriptSig.clear();
-		pBlock->vtx[0].vin[0].scriptSig << GetNextWorkRequired(pindexBest) << extraNonce;
+		pBlock->vtx[0].vin[0].scriptSig << GetNextWorkRequired(pindexBest) << CBigNum(extraNonce);
 		pBlock->hashMerkleRoot = pBlock->BuildMerkleTree();
 		uint256 hash = pBlock->GetHash();
 		uint256 hashTarget = CBigNum().SetCompact(pWorkBlock->nBits).getuint256();
-		if (hash <= hashTarget)
-		{
-			//// debug print
-			printf("proof-of-work found  \n  hash: %s  \ntarget: %s\n", hash.GetHex().c_str(), hashTarget.GetHex().c_str());
-			pBlock->print();
-			printf("%s ", DateTimeStrFormat("%x %H:%M", GetTime()).c_str());
-			printf("generated %s\n", FormatMoney(pBlock->vtx[0].vout[0].nValue).c_str());				
+		if (hash > hashTarget)
+			return;
+		//// debug print
+		printf("proof-of-work found  \n  hash: %s  \ntarget: %s\n", hash.GetHex().c_str(), hashTarget.GetHex().c_str());
+		pBlock->print();
+		printf("%s ", DateTimeStrFormat("%x %H:%M", GetTime()).c_str());
+		printf("generated %s\n", FormatMoney(pBlock->vtx[0].vout[0].nValue).c_str());				
 
-			workKey.KeepKey();
+		workKey.KeepKey();
 
-			CRITICAL_BLOCK(cs_mapRequestCount)
-				mapRequestCount[pWorkBlock->GetHash()] = 0;
-			if (!ProcessBlock(NULL, pBlock))
-			{					
-				printf("ERROR in CheckWork, ProcessBlock, block not accepted\n");
-			}
+		CRITICAL_BLOCK(cs_mapRequestCount)
+			mapRequestCount[pWorkBlock->GetHash()] = 0;
+		if (!ProcessBlock(NULL, pBlock))
+		{					
+			printf("ERROR in CheckWork, ProcessBlock, block not accepted\n");
 		}
 	}
 }
 
-void PrepareWork(Workspace& workspace, uint256& state, uint256& target, CBigNum& extraNonce)
+void PrepareWork(Workspace& workspace, uint256& state, uint256& target, unsigned int& extraNonce)
 {
 	CRITICAL_BLOCK(work)
 	{
 		CBlockIndex* pIndexPrev = pindexBest;
 		unsigned int nBits = GetNextWorkRequired(pIndexPrev);
-		extraNonce = ++bnExtraNonce;	
 		if (nTransactionsUpdated != nsTransactionsUpdatedLast || pWorkBlock->hashPrevBlock != pIndexPrev->GetBlockHash())
 		{
 			nsTransactionsUpdatedLast = nTransactionsUpdated;
@@ -2981,6 +3007,12 @@ void PrepareWork(Workspace& workspace, uint256& state, uint256& target, CBigNum&
 			CTransaction txNew;
 			txNew.vin.resize(1);
 			txNew.vin[0].prevout.SetNull();
+			int64 nNow = max(pIndexPrev->GetMedianTimePast()+1, GetAdjustedTime());
+			if (nNow > nPrevTime+1 && ++nExtraNonce >= 0x7f)
+			{
+				nExtraNonce = 1;
+				nPrevTime = nNow;
+			}
 			txNew.vout.resize(1);
 			txNew.vout[0].scriptPubKey << workKey.GetReservedKey() << OP_CHECKSIG;
 			pWorkBlock->vtx.push_back(txNew);
@@ -3031,12 +3063,13 @@ void PrepareWork(Workspace& workspace, uint256& state, uint256& target, CBigNum&
 			}
 			pWorkBlock->vtx[0].vout[0].nValue = GetBlockValue(pIndexPrev->nHeight+1, nFees);
 
-			pWorkBlock->hashPrevBlock         = (pIndexPrev ? pIndexPrev->GetBlockHash() : 0);
+			pWorkBlock->hashPrevBlock         = pIndexPrev->GetBlockHash();
 			pWorkBlock->nBits                 = nBits;	
 		}
 		
 		pWorkBlock->vtx[0].vin[0].scriptSig.clear();
-		pWorkBlock->vtx[0].vin[0].scriptSig << nBits << bnExtraNonce;
+		pWorkBlock->vtx[0].vin[0].scriptSig << nBits << CBigNum(nExtraNonce);
+		extraNonce = nExtraNonce;
 
 		workspace.block.nVersion       = pWorkBlock->nVersion;
 		workspace.block.hashPrevBlock  = pWorkBlock->hashPrevBlock;
@@ -3044,11 +3077,7 @@ void PrepareWork(Workspace& workspace, uint256& state, uint256& target, CBigNum&
 		workspace.block.nBits          = pWorkBlock->nBits;
 		workspace.block.nNonce         = 0;
 
-		// Update nTime
-		int64 nNewTime = max(pIndexPrev->GetMedianTimePast()+1, GetAdjustedTime());
-		if (nNewTime != pWorkBlock->nTime && bnExtraNonce > 10)
-			bnExtraNonce = 0;
-		workspace.block.nTime = pWorkBlock->nTime = nNewTime;
+		workspace.block.nTime = pWorkBlock->nTime = max(pIndexPrev->GetMedianTimePast()+1, GetAdjustedTime());
 
 		unsigned int nBlocks0 = FormatHashBlocks(&workspace.block, sizeof(workspace.block));
 		unsigned int nBlocks1 = FormatHashBlocks(&workspace.hash1, sizeof(workspace.hash1));
@@ -3070,7 +3099,7 @@ void BitcoinMiner()
     if (mapArgs.count("-4way"))
         f4WaySSE2 = (mapArgs["-4way"] != "0");
 
-	CBigNum extraNonce;
+    unsigned int nExtraNonce = 0;
 	uint256 midstatebuf2[2];
 	uint256& midstate = *alignup<16>(midstatebuf2);	
 	char tmpbuf2[sizeof(Workspace)+16];
@@ -3078,7 +3107,8 @@ void BitcoinMiner()
 	uint256 hashTarget;
     while (fGenerateBitcoins)
     {
-        Sleep(50);
+        if (AffinityBugWorkaround(ThreadBitcoinMiner))
+            return;
         if (fShutdown)
             return;
         while (vNodes.empty() || IsInitialBlockDownload())
@@ -3093,7 +3123,7 @@ void BitcoinMiner()
         unsigned int nTransactionsUpdatedLast = nTransactionsUpdated;
         CBlockIndex* pindexPrev = pindexBest;
 
-		PrepareWork(tmp, midstate, hashTarget, extraNonce);
+		PrepareWork(tmp, midstate, hashTarget, nExtraNonce);
 		
 		printf("Running BitcoinMiner with %d transactions in block\n", pWorkBlock->vtx.size());
 
@@ -3131,7 +3161,7 @@ void BitcoinMiner()
                     printf("BitcoinMiner: \n");
 					tmp.block.nNonce = nNonceFound;
 					SetThreadPriority(THREAD_PRIORITY_NORMAL);					
-					CheckWork(tmp, extraNonce);
+					CheckWork(tmp, nExtraNonce);
 					SetThreadPriority(THREAD_PRIORITY_LOWEST);
 
                     Sleep(500);
@@ -3188,7 +3218,7 @@ void BitcoinMiner()
                 break;
 
             // Update nTime every few seconds
-            tmp.block.nTime = ByteReverse((unsigned int)max(pindexPrev->GetMedianTimePast()+1, GetAdjustedTime()));
+			tmp.block.nTime = ByteReverse((unsigned int)max(pindexPrev->GetMedianTimePast()+1, GetAdjustedTime()));
         }
     }
 }
