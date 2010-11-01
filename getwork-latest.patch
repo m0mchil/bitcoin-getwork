@@ -1,8 +1,8 @@
 Index: main.cpp
 ===================================================================
---- main.cpp	(revision 170)
+--- main.cpp	(revision 173)
 +++ main.cpp	(working copy)
-@@ -2947,8 +2947,150 @@
+@@ -3002,8 +3002,150 @@
  extern unsigned int ScanHash_4WaySSE2(char* pmidstate, char* pblock, char* phash1, char* phash, unsigned int& nHashesDone);
  
  
@@ -66,12 +66,6 @@ Index: main.cpp
 +			CTransaction txNew;
 +			txNew.vin.resize(1);
 +			txNew.vin[0].prevout.SetNull();
-+			int64 nNow = max(pIndexPrev->GetMedianTimePast()+1, GetAdjustedTime());
-+			if (nNow > nPrevTime+1 && ++nExtraNonce >= 0x7f)
-+			{
-+				nExtraNonce = 1;
-+				nPrevTime = nNow;
-+			}
 +			txNew.vout.resize(1);
 +			txNew.vout[0].scriptPubKey << workKey.GetReservedKey() << OP_CHECKSIG;
 +			pWorkBlock->vtx.push_back(txNew);
@@ -126,6 +120,13 @@ Index: main.cpp
 +			pWorkBlock->nBits                 = nBits;	
 +		}
 +		
++		int64 nNow = max(pIndexPrev->GetMedianTimePast()+1, GetAdjustedTime());
++		if (++nExtraNonce >= 0x7f && nNow > nPrevTime+1)
++		{
++			nExtraNonce = 1;
++			nPrevTime = nNow;
++		}
++		
 +		pWorkBlock->vtx[0].vin[0].scriptSig.clear();
 +		pWorkBlock->vtx[0].vin[0].scriptSig << nBits << CBigNum(nExtraNonce);
 +		extraNonce = nExtraNonce;
@@ -136,11 +137,10 @@ Index: main.cpp
 +		workspace.block.nBits          = pWorkBlock->nBits;
 +		workspace.block.nNonce         = 0;
 +
-+		workspace.block.nTime = pWorkBlock->nTime = max(pIndexPrev->GetMedianTimePast()+1, GetAdjustedTime());
-+
++		workspace.block.nTime = pWorkBlock->nTime = nNow;
 +		unsigned int nBlocks0 = FormatHashBlocks(&workspace.block, sizeof(workspace.block));
 +		unsigned int nBlocks1 = FormatHashBlocks(&workspace.hash1, sizeof(workspace.hash1));
-+		
++
 +		target = CBigNum().SetCompact(pWorkBlock->nBits).getuint256();
 +
 +		for (int i = 0; i < sizeof(workspace)/4; i++)
@@ -153,7 +153,7 @@ Index: main.cpp
  void BitcoinMiner()
  {
      printf("BitcoinMiner started\n");
-@@ -2957,9 +3099,12 @@
+@@ -3012,9 +3154,12 @@
      if (mapArgs.count("-4way"))
          f4WaySSE2 = (mapArgs["-4way"] != "0");
  
@@ -168,7 +168,7 @@ Index: main.cpp
      while (fGenerateBitcoins)
      {
          if (AffinityBugWorkaround(ThreadBitcoinMiner))
-@@ -2977,133 +3122,16 @@
+@@ -3032,133 +3177,16 @@
  
          unsigned int nTransactionsUpdatedLast = nTransactionsUpdated;
          CBlockIndex* pindexPrev = pindexBest;
@@ -185,7 +185,7 @@ Index: main.cpp
 -        txNew.vin.resize(1);
 -        txNew.vin[0].prevout.SetNull();
 -        int64 nNow = max(pindexPrev->GetMedianTimePast()+1, GetAdjustedTime());
--        if (nNow > nPrevTime+1 && ++nExtraNonce >= 0x7f)
+-        if (++nExtraNonce >= 0x7f && nNow > nPrevTime+1)
 -        {
 -            nExtraNonce = 1;
 -            nPrevTime = nNow;
@@ -305,7 +305,7 @@ Index: main.cpp
          uint256 hashbuf[2];
          uint256& hash = *alignup<16>(hashbuf);
          loop
-@@ -3129,35 +3157,13 @@
+@@ -3184,35 +3212,13 @@
                  if (hash <= hashTarget)
                  {
                      // Found a solution
@@ -347,7 +347,7 @@ Index: main.cpp
                      Sleep(500);
                      break;
                  }
-@@ -3212,8 +3218,7 @@
+@@ -3267,8 +3273,7 @@
                  break;
  
              // Update nTime every few seconds
@@ -359,7 +359,7 @@ Index: main.cpp
  }
 Index: main.h
 ===================================================================
---- main.h	(revision 170)
+--- main.h	(revision 173)
 +++ main.h	(working copy)
 @@ -60,6 +60,22 @@
  
@@ -395,9 +395,9 @@ Index: main.h
  
 Index: rpc.cpp
 ===================================================================
---- rpc.cpp	(revision 170)
+--- rpc.cpp	(revision 173)
 +++ rpc.cpp	(working copy)
-@@ -677,16 +677,84 @@
+@@ -680,14 +680,73 @@
      return ret;
  }
  
@@ -446,17 +446,17 @@ Index: rpc.cpp
 +			}
 +		}
 +	}
-+	
+ 
 +	PrepareWork(workspace, state, target, extraNonce);
 +	
 +	char workspaceHex[HEX_BLOCK_SIZE + 1];	
 +	for (int i = 0; i < BLOCK_SIZE; i++)
 +		sprintf(workspaceHex + (i << 1), "%02x", ((unsigned char*)&workspace)[i]);
-+		
+ 
 +	char stateHex[64 + 1];	
 +	for (int i = 0; i < 32; i++)
 +		sprintf(stateHex + (i << 1), "%02x", ((unsigned char*)&(state))[i]);
-+		
+ 
 +	char targetHex[64 + 1];	
 +	for (int i = 0; i < 32; i++)
 +		sprintf(targetHex + (i << 1), "%02x", ((unsigned char*)&(target))[i]);
@@ -470,19 +470,8 @@ Index: rpc.cpp
 +}
  
  
- 
- 
- 
-+
-+
-+
-+
-+
-+
  //
- // Call Table
- //
-@@ -717,6 +785,7 @@
+@@ -720,6 +779,7 @@
      make_pair("listreceivedbylabel",   &listreceivedbylabel),
      make_pair("backupwallet",          &backupwallet),
      make_pair("validateaddress",       &validateaddress),
