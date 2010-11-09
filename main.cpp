@@ -277,6 +277,34 @@ void EraseOrphanTx(uint256 hash)
 // CTransaction
 //
 
+bool CTransaction::ReadFromDisk(CTxDB& txdb, COutPoint prevout, CTxIndex& txindexRet)
+{
+    SetNull();
+    if (!txdb.ReadTxIndex(prevout.hash, txindexRet))
+        return false;
+    if (!ReadFromDisk(txindexRet.pos))
+        return false;
+    if (prevout.n >= vout.size())
+    {
+        SetNull();
+        return false;
+    }
+    return true;
+}
+
+bool CTransaction::ReadFromDisk(CTxDB& txdb, COutPoint prevout)
+{
+    CTxIndex txindex;
+    return ReadFromDisk(txdb, prevout, txindex);
+}
+
+bool CTransaction::ReadFromDisk(COutPoint prevout)
+{
+    CTxDB txdb("r");
+    CTxIndex txindex;
+    return ReadFromDisk(txdb, prevout, txindex);
+}
+
 bool CTxIn::IsMine() const
 {
     CRITICAL_BLOCK(cs_mapWallet)
@@ -929,7 +957,7 @@ bool CheckProofOfWork(uint256 hash, unsigned int nBits)
 
 bool IsInitialBlockDownload()
 {
-    if (pindexBest == NULL || nBestHeight < 74000)
+    if (pindexBest == NULL || (!fTestNet && nBestHeight < 74000))
         return true;
     static int64 nLastUpdate;
     static CBlockIndex* pindexLastBest;
@@ -2882,7 +2910,7 @@ void CallCPUID(int in, int& aret, int& cret)
         "mov %2, %%eax; " // in into eax
         "cpuid;"
         "mov %%eax, %0;" // eax into a
-        "mov %%ecx, %1;" // eax into c
+        "mov %%ecx, %1;" // ecx into c
         :"=r"(a),"=r"(c) /* output */
         :"r"(in) /* input */
         :"%eax","%ecx" /* clobbered register */
@@ -3052,7 +3080,6 @@ void PrepareWork(Workspace& workspace, uint256& state, uint256& target, unsigned
 	CRITICAL_BLOCK(work)
 	{
 		CBlockIndex* pIndexPrev = pindexBest;
-		unsigned int nBits = GetNextWorkRequired(pIndexPrev);
 		if (nTransactionsUpdated != nsTransactionsUpdatedLast || pWorkBlock->hashPrevBlock != pIndexPrev->GetBlockHash())
 		{
 			nsTransactionsUpdatedLast = nTransactionsUpdated;
@@ -3071,49 +3098,104 @@ void PrepareWork(Workspace& workspace, uint256& state, uint256& target, unsigned
 			CRITICAL_BLOCK(cs_mapTransactions)
 			{
 				CTxDB txdb("r");
+
+				// Priority order to process transactions
+				multimap<double, CTransaction*> mapPriority;
+				for (map<uint256, CTransaction>::iterator mi = mapTransactions.begin(); mi != mapTransactions.end(); ++mi)
+				{
+					CTransaction& tx = (*mi).second;
+					if (tx.IsCoinBase() || !tx.IsFinal())
+						continue;
+
+					double dPriority = 0;
+					foreach(const CTxIn& txin, tx.vin)
+					{
+						// Read prev transaction
+						CTransaction txPrev;
+						CTxIndex txindex;
+						if (!txPrev.ReadFromDisk(txdb, txin.prevout, txindex))
+							continue;
+						int64 nValueIn = txPrev.vout[txin.prevout.n].nValue;
+
+						// Read block header
+						int nConf = 0;
+						CBlock block;
+						if (block.ReadFromDisk(txindex.pos.nFile, txindex.pos.nBlockPos, false))
+						{
+							map<uint256, CBlockIndex*>::iterator it = mapBlockIndex.find(block.GetHash());
+							if (it != mapBlockIndex.end())
+							{
+								CBlockIndex* pindex = (*it).second;
+								if (pindex->IsInMainChain())
+									nConf = 1 + nBestHeight - pindex->nHeight;
+							}
+						}
+
+						dPriority += (double)nValueIn * nConf;
+
+						if (fDebug && mapArgs.count("-printpriority"))
+							printf("priority     nValueIn=%-12I64d nConf=%-5d dPriority=%-20.1f\n", nValueIn, nConf, dPriority);
+					}
+
+					// Priority is sum(valuein * age) / txsize
+					dPriority /= ::GetSerializeSize(tx, SER_NETWORK);
+
+					mapPriority.insert(make_pair(-dPriority, &(*mi).second));
+
+					if (fDebug && mapArgs.count("-printpriority"))
+						printf("priority %-20.1f %s\n%s\n", dPriority, tx.GetHash().ToString().substr(0,10).c_str(), tx.ToString().c_str());
+				}
+
+				// Collect transactions into block
 				map<uint256, CTxIndex> mapTestPool;
-				vector<char> vfAlreadyAdded(mapTransactions.size());
-				bool fFoundSomething = true;
 				uint64 nBlockSize = 1000;
 				int nBlockSigOps = 100;
+				bool fFoundSomething = true;
 				while (fFoundSomething)
 				{
 					fFoundSomething = false;
-					unsigned int n = 0;
-					for (map<uint256, CTransaction>::iterator mi = mapTransactions.begin(); mi != mapTransactions.end(); ++mi, ++n)
+					for (multimap<double, CTransaction*>::iterator mi = mapPriority.begin(); mi != mapPriority.end();)
 					{
-						if (vfAlreadyAdded[n])
-							continue;
-						CTransaction& tx = (*mi).second;
-						if (tx.IsCoinBase() || !tx.IsFinal())
-							continue;
+						CTransaction& tx = *(*mi).second;
 						unsigned int nTxSize = ::GetSerializeSize(tx, SER_NETWORK);
 						if (nBlockSize + nTxSize >= MAX_BLOCK_SIZE_GEN)
+						{
+							mapPriority.erase(mi++);
 							continue;
+						}
 						int nTxSigOps = tx.GetSigOpCount();
 						if (nBlockSigOps + nTxSigOps >= MAX_BLOCK_SIGOPS)
+						{
+							mapPriority.erase(mi++);
 							continue;
+						}
 
 						// Transaction fee based on block size
 						int64 nMinFee = tx.GetMinFee(nBlockSize);
 
+						// Connecting can fail due to dependency on other memory pool transactions
+						// that aren't in the block yet, so keep trying in later passes
 						map<uint256, CTxIndex> mapTestPoolTmp(mapTestPool);
 						if (!tx.ConnectInputs(txdb, mapTestPoolTmp, CDiskTxPos(1,1,1), pIndexPrev, nFees, false, true, nMinFee))
+						{
+							mi++;
 							continue;
+						}
 						swap(mapTestPool, mapTestPoolTmp);
 
+						// Added
 						pWorkBlock->vtx.push_back(tx);
 						nBlockSize += nTxSize;
 						nBlockSigOps += nTxSigOps;
-						vfAlreadyAdded[n] = true;
 						fFoundSomething = true;
+						mapPriority.erase(mi++);
 					}
 				}
 			}
 			pWorkBlock->vtx[0].vout[0].nValue = GetBlockValue(pIndexPrev->nHeight+1, nFees);
 
 			pWorkBlock->hashPrevBlock         = pIndexPrev->GetBlockHash();
-			pWorkBlock->nBits                 = nBits;	
+			pWorkBlock->nBits                 = GetNextWorkRequired(pIndexPrev);	
 		}
 		
 		int64 nNow = max(pIndexPrev->GetMedianTimePast()+1, GetAdjustedTime());
@@ -3124,7 +3206,7 @@ void PrepareWork(Workspace& workspace, uint256& state, uint256& target, unsigned
 		}
 		
 		pWorkBlock->vtx[0].vin[0].scriptSig.clear();
-		pWorkBlock->vtx[0].vin[0].scriptSig << nBits << CBigNum(nExtraNonce);
+		pWorkBlock->vtx[0].vin[0].scriptSig << pWorkBlock->nBits << CBigNum(nExtraNonce);
 		extraNonce = nExtraNonce;
 
 		workspace.block.nVersion       = pWorkBlock->nVersion;
@@ -3273,7 +3355,7 @@ void BitcoinMiner()
                 break;
 
             // Update nTime every few seconds
-			tmp.block.nTime = ByteReverse((unsigned int)max(pindexPrev->GetMedianTimePast()+1, GetAdjustedTime()));
+            tmp.block.nTime = ByteReverse((unsigned int)max(pindexPrev->GetMedianTimePast()+1, GetAdjustedTime()));
         }
     }
 }
@@ -3431,16 +3513,15 @@ bool SelectCoins(int64 nTargetValue, set<CWalletTx*>& setCoinsRet)
 
 
 
-bool CreateTransaction(CScript scriptPubKey, int64 nValue, CWalletTx& wtxNew, CReserveKey& reservekey, int64& nFeeRequiredRet)
+bool CreateTransaction(CScript scriptPubKey, int64 nValue, CWalletTx& wtxNew, CReserveKey& reservekey, int64& nFeeRet)
 {
-    nFeeRequiredRet = 0;
     CRITICAL_BLOCK(cs_main)
     {
         // txdb must be opened before the mapWallet lock
         CTxDB txdb("r");
         CRITICAL_BLOCK(cs_mapWallet)
         {
-            int64 nFee = nTransactionFee;
+            nFeeRet = nTransactionFee;
             loop
             {
                 wtxNew.vin.clear();
@@ -3449,7 +3530,7 @@ bool CreateTransaction(CScript scriptPubKey, int64 nValue, CWalletTx& wtxNew, CR
                 if (nValue < 0)
                     return false;
                 int64 nValueOut = nValue;
-                int64 nTotalValue = nValue + nFee;
+                int64 nTotalValue = nValue + nFeeRet;
 
                 // Choose coins to use
                 set<CWalletTx*> setCoins;
@@ -3509,13 +3590,16 @@ bool CreateTransaction(CScript scriptPubKey, int64 nValue, CWalletTx& wtxNew, CR
                                 return false;
 
                 // Limit size
-                if (::GetSerializeSize(*(CTransaction*)&wtxNew, SER_NETWORK) >= MAX_BLOCK_SIZE_GEN/5)
+                unsigned int nBytes = ::GetSerializeSize(*(CTransaction*)&wtxNew, SER_NETWORK);
+                if (nBytes >= MAX_BLOCK_SIZE_GEN/5)
                     return false;
 
                 // Check that enough fee is included
-                if (nFee < wtxNew.GetMinFee())
+                int64 nPayFee = nTransactionFee * (1 + (int64)nBytes / 1000);
+                int64 nMinFee = wtxNew.GetMinFee();
+                if (nFeeRet < max(nPayFee, nMinFee))
                 {
-                    nFee = nFeeRequiredRet = wtxNew.GetMinFee();
+                    nFeeRet = max(nPayFee, nMinFee);
                     continue;
                 }
 

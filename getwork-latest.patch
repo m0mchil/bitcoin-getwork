@@ -1,8 +1,8 @@
 Index: main.cpp
 ===================================================================
---- main.cpp	(revision 173)
+--- main.cpp	(revision 176)
 +++ main.cpp	(working copy)
-@@ -3002,8 +3002,150 @@
+@@ -3030,8 +3030,204 @@
  extern unsigned int ScanHash_4WaySSE2(char* pmidstate, char* pblock, char* phash1, char* phash, unsigned int& nHashesDone);
  
  
@@ -56,7 +56,6 @@ Index: main.cpp
 +	CRITICAL_BLOCK(work)
 +	{
 +		CBlockIndex* pIndexPrev = pindexBest;
-+		unsigned int nBits = GetNextWorkRequired(pIndexPrev);
 +		if (nTransactionsUpdated != nsTransactionsUpdatedLast || pWorkBlock->hashPrevBlock != pIndexPrev->GetBlockHash())
 +		{
 +			nsTransactionsUpdatedLast = nTransactionsUpdated;
@@ -75,49 +74,104 @@ Index: main.cpp
 +			CRITICAL_BLOCK(cs_mapTransactions)
 +			{
 +				CTxDB txdb("r");
++
++				// Priority order to process transactions
++				multimap<double, CTransaction*> mapPriority;
++				for (map<uint256, CTransaction>::iterator mi = mapTransactions.begin(); mi != mapTransactions.end(); ++mi)
++				{
++					CTransaction& tx = (*mi).second;
++					if (tx.IsCoinBase() || !tx.IsFinal())
++						continue;
++
++					double dPriority = 0;
++					foreach(const CTxIn& txin, tx.vin)
++					{
++						// Read prev transaction
++						CTransaction txPrev;
++						CTxIndex txindex;
++						if (!txPrev.ReadFromDisk(txdb, txin.prevout, txindex))
++							continue;
++						int64 nValueIn = txPrev.vout[txin.prevout.n].nValue;
++
++						// Read block header
++						int nConf = 0;
++						CBlock block;
++						if (block.ReadFromDisk(txindex.pos.nFile, txindex.pos.nBlockPos, false))
++						{
++							map<uint256, CBlockIndex*>::iterator it = mapBlockIndex.find(block.GetHash());
++							if (it != mapBlockIndex.end())
++							{
++								CBlockIndex* pindex = (*it).second;
++								if (pindex->IsInMainChain())
++									nConf = 1 + nBestHeight - pindex->nHeight;
++							}
++						}
++
++						dPriority += (double)nValueIn * nConf;
++
++						if (fDebug && mapArgs.count("-printpriority"))
++							printf("priority     nValueIn=%-12I64d nConf=%-5d dPriority=%-20.1f\n", nValueIn, nConf, dPriority);
++					}
++
++					// Priority is sum(valuein * age) / txsize
++					dPriority /= ::GetSerializeSize(tx, SER_NETWORK);
++
++					mapPriority.insert(make_pair(-dPriority, &(*mi).second));
++
++					if (fDebug && mapArgs.count("-printpriority"))
++						printf("priority %-20.1f %s\n%s\n", dPriority, tx.GetHash().ToString().substr(0,10).c_str(), tx.ToString().c_str());
++				}
++
++				// Collect transactions into block
 +				map<uint256, CTxIndex> mapTestPool;
-+				vector<char> vfAlreadyAdded(mapTransactions.size());
-+				bool fFoundSomething = true;
 +				uint64 nBlockSize = 1000;
 +				int nBlockSigOps = 100;
++				bool fFoundSomething = true;
 +				while (fFoundSomething)
 +				{
 +					fFoundSomething = false;
-+					unsigned int n = 0;
-+					for (map<uint256, CTransaction>::iterator mi = mapTransactions.begin(); mi != mapTransactions.end(); ++mi, ++n)
++					for (multimap<double, CTransaction*>::iterator mi = mapPriority.begin(); mi != mapPriority.end();)
 +					{
-+						if (vfAlreadyAdded[n])
-+							continue;
-+						CTransaction& tx = (*mi).second;
-+						if (tx.IsCoinBase() || !tx.IsFinal())
-+							continue;
++						CTransaction& tx = *(*mi).second;
 +						unsigned int nTxSize = ::GetSerializeSize(tx, SER_NETWORK);
 +						if (nBlockSize + nTxSize >= MAX_BLOCK_SIZE_GEN)
++						{
++							mapPriority.erase(mi++);
 +							continue;
++						}
 +						int nTxSigOps = tx.GetSigOpCount();
 +						if (nBlockSigOps + nTxSigOps >= MAX_BLOCK_SIGOPS)
++						{
++							mapPriority.erase(mi++);
 +							continue;
++						}
 +
 +						// Transaction fee based on block size
 +						int64 nMinFee = tx.GetMinFee(nBlockSize);
 +
++						// Connecting can fail due to dependency on other memory pool transactions
++						// that aren't in the block yet, so keep trying in later passes
 +						map<uint256, CTxIndex> mapTestPoolTmp(mapTestPool);
 +						if (!tx.ConnectInputs(txdb, mapTestPoolTmp, CDiskTxPos(1,1,1), pIndexPrev, nFees, false, true, nMinFee))
++						{
++							mi++;
 +							continue;
++						}
 +						swap(mapTestPool, mapTestPoolTmp);
 +
++						// Added
 +						pWorkBlock->vtx.push_back(tx);
 +						nBlockSize += nTxSize;
 +						nBlockSigOps += nTxSigOps;
-+						vfAlreadyAdded[n] = true;
 +						fFoundSomething = true;
++						mapPriority.erase(mi++);
 +					}
 +				}
 +			}
 +			pWorkBlock->vtx[0].vout[0].nValue = GetBlockValue(pIndexPrev->nHeight+1, nFees);
 +
 +			pWorkBlock->hashPrevBlock         = pIndexPrev->GetBlockHash();
-+			pWorkBlock->nBits                 = nBits;	
++			pWorkBlock->nBits                 = GetNextWorkRequired(pIndexPrev);	
 +		}
 +		
 +		int64 nNow = max(pIndexPrev->GetMedianTimePast()+1, GetAdjustedTime());
@@ -128,7 +182,7 @@ Index: main.cpp
 +		}
 +		
 +		pWorkBlock->vtx[0].vin[0].scriptSig.clear();
-+		pWorkBlock->vtx[0].vin[0].scriptSig << nBits << CBigNum(nExtraNonce);
++		pWorkBlock->vtx[0].vin[0].scriptSig << pWorkBlock->nBits << CBigNum(nExtraNonce);
 +		extraNonce = nExtraNonce;
 +
 +		workspace.block.nVersion       = pWorkBlock->nVersion;
@@ -153,7 +207,7 @@ Index: main.cpp
  void BitcoinMiner()
  {
      printf("BitcoinMiner started\n");
-@@ -3012,9 +3154,12 @@
+@@ -3040,9 +3236,12 @@
      if (mapArgs.count("-4way"))
          f4WaySSE2 = (mapArgs["-4way"] != "0");
  
@@ -168,7 +222,7 @@ Index: main.cpp
      while (fGenerateBitcoins)
      {
          if (AffinityBugWorkaround(ThreadBitcoinMiner))
-@@ -3032,133 +3177,16 @@
+@@ -3060,188 +3259,16 @@
  
          unsigned int nTransactionsUpdatedLast = nTransactionsUpdated;
          CBlockIndex* pindexPrev = pindexBest;
@@ -211,42 +265,97 @@ Index: main.cpp
 -        CRITICAL_BLOCK(cs_mapTransactions)
 -        {
 -            CTxDB txdb("r");
+-
+-            // Priority order to process transactions
+-            multimap<double, CTransaction*> mapPriority;
+-            for (map<uint256, CTransaction>::iterator mi = mapTransactions.begin(); mi != mapTransactions.end(); ++mi)
+-            {
+-                CTransaction& tx = (*mi).second;
+-                if (tx.IsCoinBase() || !tx.IsFinal())
+-                    continue;
+-
+-                double dPriority = 0;
+-                foreach(const CTxIn& txin, tx.vin)
+-                {
+-                    // Read prev transaction
+-                    CTransaction txPrev;
+-                    CTxIndex txindex;
+-                    if (!txPrev.ReadFromDisk(txdb, txin.prevout, txindex))
+-                        continue;
+-                    int64 nValueIn = txPrev.vout[txin.prevout.n].nValue;
+-
+-                    // Read block header
+-                    int nConf = 0;
+-                    CBlock block;
+-                    if (block.ReadFromDisk(txindex.pos.nFile, txindex.pos.nBlockPos, false))
+-                    {
+-                        map<uint256, CBlockIndex*>::iterator it = mapBlockIndex.find(block.GetHash());
+-                        if (it != mapBlockIndex.end())
+-                        {
+-                            CBlockIndex* pindex = (*it).second;
+-                            if (pindex->IsInMainChain())
+-                                nConf = 1 + nBestHeight - pindex->nHeight;
+-                        }
+-                    }
+-
+-                    dPriority += (double)nValueIn * nConf;
+-
+-                    if (fDebug && mapArgs.count("-printpriority"))
+-                        printf("priority     nValueIn=%-12I64d nConf=%-5d dPriority=%-20.1f\n", nValueIn, nConf, dPriority);
+-                }
+-
+-                // Priority is sum(valuein * age) / txsize
+-                dPriority /= ::GetSerializeSize(tx, SER_NETWORK);
+-
+-                mapPriority.insert(make_pair(-dPriority, &(*mi).second));
+-
+-                if (fDebug && mapArgs.count("-printpriority"))
+-                    printf("priority %-20.1f %s\n%s\n", dPriority, tx.GetHash().ToString().substr(0,10).c_str(), tx.ToString().c_str());
+-            }
+-
+-            // Collect transactions into block
 -            map<uint256, CTxIndex> mapTestPool;
--            vector<char> vfAlreadyAdded(mapTransactions.size());
 -            uint64 nBlockSize = 1000;
 -            int nBlockSigOps = 100;
 -            bool fFoundSomething = true;
 -            while (fFoundSomething)
 -            {
 -                fFoundSomething = false;
--                unsigned int n = 0;
--                for (map<uint256, CTransaction>::iterator mi = mapTransactions.begin(); mi != mapTransactions.end(); ++mi, ++n)
+-                for (multimap<double, CTransaction*>::iterator mi = mapPriority.begin(); mi != mapPriority.end();)
 -                {
--                    if (vfAlreadyAdded[n])
--                        continue;
--                    CTransaction& tx = (*mi).second;
--                    if (tx.IsCoinBase() || !tx.IsFinal())
--                        continue;
+-                    CTransaction& tx = *(*mi).second;
 -                    unsigned int nTxSize = ::GetSerializeSize(tx, SER_NETWORK);
 -                    if (nBlockSize + nTxSize >= MAX_BLOCK_SIZE_GEN)
+-                    {
+-                        mapPriority.erase(mi++);
 -                        continue;
+-                    }
 -                    int nTxSigOps = tx.GetSigOpCount();
 -                    if (nBlockSigOps + nTxSigOps >= MAX_BLOCK_SIGOPS)
+-                    {
+-                        mapPriority.erase(mi++);
 -                        continue;
+-                    }
 -
 -                    // Transaction fee based on block size
 -                    int64 nMinFee = tx.GetMinFee(nBlockSize);
 -
+-                    // Connecting can fail due to dependency on other memory pool transactions
+-                    // that aren't in the block yet, so keep trying in later passes
 -                    map<uint256, CTxIndex> mapTestPoolTmp(mapTestPool);
 -                    if (!tx.ConnectInputs(txdb, mapTestPoolTmp, CDiskTxPos(1,1,1), pindexPrev, nFees, false, true, nMinFee))
+-                    {
+-                        mi++;
 -                        continue;
+-                    }
 -                    swap(mapTestPool, mapTestPoolTmp);
 -
+-                    // Added
 -                    pblock->vtx.push_back(tx);
 -                    nBlockSize += nTxSize;
 -                    nBlockSigOps += nTxSigOps;
--                    vfAlreadyAdded[n] = true;
 -                    fFoundSomething = true;
+-                    mapPriority.erase(mi++);
 -                }
 -            }
 -        }
@@ -305,7 +414,7 @@ Index: main.cpp
          uint256 hashbuf[2];
          uint256& hash = *alignup<16>(hashbuf);
          loop
-@@ -3184,35 +3212,13 @@
+@@ -3267,35 +3294,13 @@
                  if (hash <= hashTarget)
                  {
                      // Found a solution
@@ -347,19 +456,19 @@ Index: main.cpp
                      Sleep(500);
                      break;
                  }
-@@ -3267,8 +3273,7 @@
+@@ -3350,8 +3355,7 @@
                  break;
  
              // Update nTime every few seconds
 -            pblock->nTime = max(pindexPrev->GetMedianTimePast()+1, GetAdjustedTime());
 -            tmp.block.nTime = ByteReverse(pblock->nTime);
-+			tmp.block.nTime = ByteReverse((unsigned int)max(pindexPrev->GetMedianTimePast()+1, GetAdjustedTime()));
++            tmp.block.nTime = ByteReverse((unsigned int)max(pindexPrev->GetMedianTimePast()+1, GetAdjustedTime()));
          }
      }
  }
 Index: main.h
 ===================================================================
---- main.h	(revision 173)
+--- main.h	(revision 176)
 +++ main.h	(working copy)
 @@ -60,6 +60,22 @@
  
@@ -395,7 +504,7 @@ Index: main.h
  
 Index: rpc.cpp
 ===================================================================
---- rpc.cpp	(revision 173)
+--- rpc.cpp	(revision 176)
 +++ rpc.cpp	(working copy)
 @@ -680,14 +680,73 @@
      return ret;
