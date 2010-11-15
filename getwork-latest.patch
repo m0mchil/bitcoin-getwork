@@ -1,6 +1,6 @@
 Index: main.cpp
 ===================================================================
---- main.cpp	(revision 176)
+--- main.cpp	(revision 179)
 +++ main.cpp	(working copy)
 @@ -3030,8 +3030,204 @@
  extern unsigned int ScanHash_4WaySSE2(char* pmidstate, char* pblock, char* phash1, char* phash, unsigned int& nHashesDone);
@@ -468,7 +468,7 @@ Index: main.cpp
  }
 Index: main.h
 ===================================================================
---- main.h	(revision 176)
+--- main.h	(revision 179)
 +++ main.h	(working copy)
 @@ -60,6 +60,22 @@
  
@@ -504,9 +504,9 @@ Index: main.h
  
 Index: rpc.cpp
 ===================================================================
---- rpc.cpp	(revision 176)
+--- rpc.cpp	(revision 179)
 +++ rpc.cpp	(working copy)
-@@ -680,14 +680,73 @@
+@@ -681,14 +681,73 @@
      return ret;
  }
  
@@ -580,7 +580,7 @@ Index: rpc.cpp
  
  
  //
-@@ -720,6 +779,7 @@
+@@ -721,6 +780,7 @@
      make_pair("listreceivedbylabel",   &listreceivedbylabel),
      make_pair("backupwallet",          &backupwallet),
      make_pair("validateaddress",       &validateaddress),
