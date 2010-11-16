@@ -3034,6 +3034,7 @@ CBlock* pWorkBlock = new CBlock();
 CReserveKey workKey;
 unsigned int nExtraNonce = 0;
 int64 nPrevTime = 0;
+int64 nTransactionsUpdatedTime = 0;
 unsigned int nsTransactionsUpdatedLast;
 CCriticalSection work;
 void CheckWork(Workspace& tmp, unsigned int& extraNonce)
@@ -3080,8 +3081,10 @@ void PrepareWork(Workspace& workspace, uint256& state, uint256& target, unsigned
 	CRITICAL_BLOCK(work)
 	{
 		CBlockIndex* pIndexPrev = pindexBest;
-		if (nTransactionsUpdated != nsTransactionsUpdatedLast || pWorkBlock->hashPrevBlock != pIndexPrev->GetBlockHash())
+		if ((nTransactionsUpdated != nsTransactionsUpdatedLast && GetTime() - nTransactionsUpdatedTime > 60)
+			|| pWorkBlock->hashPrevBlock != pIndexPrev->GetBlockHash())
 		{
+			nTransactionsUpdatedTime = GetTime();
 			nsTransactionsUpdatedLast = nTransactionsUpdated;
 			
 			pWorkBlock->vtx.clear();

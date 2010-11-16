@@ -1,8 +1,8 @@
 Index: main.cpp
 ===================================================================
---- main.cpp	(revision 179)
+--- main.cpp	(revision 181)
 +++ main.cpp	(working copy)
-@@ -3030,8 +3030,204 @@
+@@ -3030,8 +3030,207 @@
  extern unsigned int ScanHash_4WaySSE2(char* pmidstate, char* pblock, char* phash1, char* phash, unsigned int& nHashesDone);
  
  
@@ -10,6 +10,7 @@ Index: main.cpp
 +CReserveKey workKey;
 +unsigned int nExtraNonce = 0;
 +int64 nPrevTime = 0;
++int64 nTransactionsUpdatedTime = 0;
 +unsigned int nsTransactionsUpdatedLast;
 +CCriticalSection work;
 +void CheckWork(Workspace& tmp, unsigned int& extraNonce)
@@ -56,8 +57,10 @@ Index: main.cpp
 +	CRITICAL_BLOCK(work)
 +	{
 +		CBlockIndex* pIndexPrev = pindexBest;
-+		if (nTransactionsUpdated != nsTransactionsUpdatedLast || pWorkBlock->hashPrevBlock != pIndexPrev->GetBlockHash())
++		if ((nTransactionsUpdated != nsTransactionsUpdatedLast && GetTime() - nTransactionsUpdatedTime > 60)
++			|| pWorkBlock->hashPrevBlock != pIndexPrev->GetBlockHash())
 +		{
++			nTransactionsUpdatedTime = GetTime();
 +			nsTransactionsUpdatedLast = nTransactionsUpdated;
 +			
 +			pWorkBlock->vtx.clear();
@@ -207,7 +210,7 @@ Index: main.cpp
  void BitcoinMiner()
  {
      printf("BitcoinMiner started\n");
-@@ -3040,9 +3236,12 @@
+@@ -3040,9 +3239,12 @@
      if (mapArgs.count("-4way"))
          f4WaySSE2 = (mapArgs["-4way"] != "0");
  
@@ -222,7 +225,7 @@ Index: main.cpp
      while (fGenerateBitcoins)
      {
          if (AffinityBugWorkaround(ThreadBitcoinMiner))
-@@ -3060,188 +3259,16 @@
+@@ -3060,188 +3262,16 @@
  
          unsigned int nTransactionsUpdatedLast = nTransactionsUpdated;
          CBlockIndex* pindexPrev = pindexBest;
@@ -414,7 +417,7 @@ Index: main.cpp
          uint256 hashbuf[2];
          uint256& hash = *alignup<16>(hashbuf);
          loop
-@@ -3267,35 +3294,13 @@
+@@ -3267,35 +3297,13 @@
                  if (hash <= hashTarget)
                  {
                      // Found a solution
@@ -456,7 +459,7 @@ Index: main.cpp
                      Sleep(500);
                      break;
                  }
-@@ -3350,8 +3355,7 @@
+@@ -3350,8 +3358,7 @@
                  break;
  
              // Update nTime every few seconds
@@ -468,7 +471,7 @@ Index: main.cpp
  }
 Index: main.h
 ===================================================================
---- main.h	(revision 179)
+--- main.h	(revision 181)
 +++ main.h	(working copy)
 @@ -60,6 +60,22 @@
  
@@ -504,7 +507,7 @@ Index: main.h
  
 Index: rpc.cpp
 ===================================================================
---- rpc.cpp	(revision 179)
+--- rpc.cpp	(revision 181)
 +++ rpc.cpp	(working copy)
 @@ -681,14 +681,73 @@
      return ret;
