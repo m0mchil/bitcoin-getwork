@@ -1,10 +1,10 @@
 Index: main.cpp
 ===================================================================
---- main.cpp	(revision 181)
+--- main.cpp	(revision 186)
 +++ main.cpp	(working copy)
-@@ -3030,8 +3030,207 @@
- extern unsigned int ScanHash_4WaySSE2(char* pmidstate, char* pblock, char* phash1, char* phash, unsigned int& nHashesDone);
- 
+@@ -3054,8 +3054,233 @@
+     }
+ };
  
 +CBlock* pWorkBlock = new CBlock();
 +CReserveKey workKey;
@@ -39,10 +39,8 @@ Index: main.cpp
 +		printf("proof-of-work found  \n  hash: %s  \ntarget: %s\n", hash.GetHex().c_str(), hashTarget.GetHex().c_str());
 +		pBlock->print();
 +		printf("%s ", DateTimeStrFormat("%x %H:%M", GetTime()).c_str());
-+		printf("generated %s\n", FormatMoney(pBlock->vtx[0].vout[0].nValue).c_str());				
- 
++		printf("generated %s\n", FormatMoney(pBlock->vtx[0].vout[0].nValue).c_str());
 +		workKey.KeepKey();
- 
 +		CRITICAL_BLOCK(cs_mapRequestCount)
 +			mapRequestCount[pWorkBlock->GetHash()] = 0;
 +		if (!ProcessBlock(NULL, pBlock))
@@ -51,7 +49,7 @@ Index: main.cpp
 +		}
 +	}
 +}
-+
+ 
 +void PrepareWork(Workspace& workspace, uint256& state, uint256& target, unsigned int& extraNonce)
 +{
 +	CRITICAL_BLOCK(work)
@@ -64,7 +62,7 @@ Index: main.cpp
 +			nsTransactionsUpdatedLast = nTransactionsUpdated;
 +			
 +			pWorkBlock->vtx.clear();
-+
+ 
 +			CTransaction txNew;
 +			txNew.vin.resize(1);
 +			txNew.vin[0].prevout.SetNull();
@@ -72,6 +70,7 @@ Index: main.cpp
 +			txNew.vout[0].scriptPubKey << workKey.GetReservedKey() << OP_CHECKSIG;
 +			pWorkBlock->vtx.push_back(txNew);
 +
++			// Collect memory pool transactions into the block
 +			int64 nFees = 0;
 +			CRITICAL_BLOCK(cs_main)
 +			CRITICAL_BLOCK(cs_mapTransactions)
@@ -79,6 +78,8 @@ Index: main.cpp
 +				CTxDB txdb("r");
 +
 +				// Priority order to process transactions
++				list<COrphan> vOrphan; // list memory doesn't move
++				map<uint256, vector<COrphan*> > mapDependers;
 +				multimap<double, CTransaction*> mapPriority;
 +				for (map<uint256, CTransaction>::iterator mi = mapTransactions.begin(); mi != mapTransactions.end(); ++mi)
 +				{
@@ -86,6 +87,7 @@ Index: main.cpp
 +					if (tx.IsCoinBase() || !tx.IsFinal())
 +						continue;
 +
++					COrphan* porphan = NULL;
 +					double dPriority = 0;
 +					foreach(const CTxIn& txin, tx.vin)
 +					{
@@ -93,7 +95,18 @@ Index: main.cpp
 +						CTransaction txPrev;
 +						CTxIndex txindex;
 +						if (!txPrev.ReadFromDisk(txdb, txin.prevout, txindex))
++						{
++							// Has to wait for dependencies
++							if (!porphan)
++							{
++								// Use list for automatic deletion
++								vOrphan.push_back(COrphan(&tx));
++								porphan = &vOrphan.back();
++							}
++							mapDependers[txin.prevout.hash].push_back(porphan);
++							porphan->setDependsOn.insert(txin.prevout.hash);
 +							continue;
++						}
 +						int64 nValueIn = txPrev.vout[txin.prevout.n].nValue;
 +
 +						// Read block header
@@ -119,55 +132,68 @@ Index: main.cpp
 +					// Priority is sum(valuein * age) / txsize
 +					dPriority /= ::GetSerializeSize(tx, SER_NETWORK);
 +
-+					mapPriority.insert(make_pair(-dPriority, &(*mi).second));
++					if (porphan)
++						porphan->dPriority = dPriority;
++					else
++						mapPriority.insert(make_pair(-dPriority, &(*mi).second));
 +
 +					if (fDebug && mapArgs.count("-printpriority"))
-+						printf("priority %-20.1f %s\n%s\n", dPriority, tx.GetHash().ToString().substr(0,10).c_str(), tx.ToString().c_str());
++					{
++						printf("priority %-20.1f %s\n%s", dPriority, tx.GetHash().ToString().substr(0,10).c_str(), tx.ToString().c_str());
++						if (porphan)
++							porphan->print();
++						printf("\n");
++					}
 +				}
 +
 +				// Collect transactions into block
 +				map<uint256, CTxIndex> mapTestPool;
 +				uint64 nBlockSize = 1000;
 +				int nBlockSigOps = 100;
-+				bool fFoundSomething = true;
-+				while (fFoundSomething)
++				while (!mapPriority.empty())
 +				{
-+					fFoundSomething = false;
-+					for (multimap<double, CTransaction*>::iterator mi = mapPriority.begin(); mi != mapPriority.end();)
++					// Take highest priority transaction off priority queue
++					double dPriority = -(*mapPriority.begin()).first;
++					CTransaction& tx = *(*mapPriority.begin()).second;
++					mapPriority.erase(mapPriority.begin());
++
++					// Size limits
++					unsigned int nTxSize = ::GetSerializeSize(tx, SER_NETWORK);
++					if (nBlockSize + nTxSize >= MAX_BLOCK_SIZE_GEN)
++						continue;
++					int nTxSigOps = tx.GetSigOpCount();
++					if (nBlockSigOps + nTxSigOps >= MAX_BLOCK_SIGOPS)
++						continue;
++
++					// Transaction fee required depends on block size
++					bool fAllowFree = (nBlockSize + nTxSize < 4000 || dPriority > COIN * 144 / 250);
++					int64 nMinFee = tx.GetMinFee(nBlockSize, fAllowFree);
++
++					// Connecting shouldn't fail due to dependency on other memory pool transactions
++					// because we're already processing them in order of dependency
++					map<uint256, CTxIndex> mapTestPoolTmp(mapTestPool);
++					if (!tx.ConnectInputs(txdb, mapTestPoolTmp, CDiskTxPos(1,1,1), pIndexPrev, nFees, false, true, nMinFee))
++						continue;
++					swap(mapTestPool, mapTestPoolTmp);
++
++					// Added
++					pWorkBlock->vtx.push_back(tx);
++					nBlockSize += nTxSize;
++					nBlockSigOps += nTxSigOps;
++
++					// Add transactions that depend on this one to the priority queue
++					uint256 hash = tx.GetHash();
++					if (mapDependers.count(hash))
 +					{
-+						CTransaction& tx = *(*mi).second;
-+						unsigned int nTxSize = ::GetSerializeSize(tx, SER_NETWORK);
-+						if (nBlockSize + nTxSize >= MAX_BLOCK_SIZE_GEN)
++						foreach(COrphan* porphan, mapDependers[hash])
 +						{
-+							mapPriority.erase(mi++);
-+							continue;
++							if (!porphan->setDependsOn.empty())
++							{
++								porphan->setDependsOn.erase(hash);
++								if (porphan->setDependsOn.empty())
++									mapPriority.insert(make_pair(-porphan->dPriority, porphan->ptx));
++							}
 +						}
-+						int nTxSigOps = tx.GetSigOpCount();
-+						if (nBlockSigOps + nTxSigOps >= MAX_BLOCK_SIGOPS)
-+						{
-+							mapPriority.erase(mi++);
-+							continue;
-+						}
-+
-+						// Transaction fee based on block size
-+						int64 nMinFee = tx.GetMinFee(nBlockSize);
-+
-+						// Connecting can fail due to dependency on other memory pool transactions
-+						// that aren't in the block yet, so keep trying in later passes
-+						map<uint256, CTxIndex> mapTestPoolTmp(mapTestPool);
-+						if (!tx.ConnectInputs(txdb, mapTestPoolTmp, CDiskTxPos(1,1,1), pIndexPrev, nFees, false, true, nMinFee))
-+						{
-+							mi++;
-+							continue;
-+						}
-+						swap(mapTestPool, mapTestPoolTmp);
-+
-+						// Added
-+						pWorkBlock->vtx.push_back(tx);
-+						nBlockSize += nTxSize;
-+						nBlockSigOps += nTxSigOps;
-+						fFoundSomething = true;
-+						mapPriority.erase(mi++);
 +					}
 +				}
 +			}
@@ -210,7 +236,7 @@ Index: main.cpp
  void BitcoinMiner()
  {
      printf("BitcoinMiner started\n");
-@@ -3040,9 +3239,12 @@
+@@ -3064,9 +3289,12 @@
      if (mapArgs.count("-4way"))
          f4WaySSE2 = (mapArgs["-4way"] != "0");
  
@@ -225,15 +251,13 @@ Index: main.cpp
      while (fGenerateBitcoins)
      {
          if (AffinityBugWorkaround(ThreadBitcoinMiner))
-@@ -3060,188 +3262,16 @@
+@@ -3084,215 +3312,15 @@
  
          unsigned int nTransactionsUpdatedLast = nTransactionsUpdated;
          CBlockIndex* pindexPrev = pindexBest;
 -        unsigned int nBits = GetNextWorkRequired(pindexPrev);
  
 +		PrepareWork(tmp, midstate, hashTarget, nExtraNonce);
-+		
-+		printf("Running BitcoinMiner with %d transactions in block\n", pWorkBlock->vtx.size());
  
 -        //
 -        // Create coinbase tx
@@ -250,6 +274,7 @@ Index: main.cpp
 -        txNew.vin[0].scriptSig << nBits << CBigNum(nExtraNonce);
 -        txNew.vout.resize(1);
 -        txNew.vout[0].scriptPubKey << reservekey.GetReservedKey() << OP_CHECKSIG;
++        printf("Running BitcoinMiner with %d transactions in block\n", pWorkBlock->vtx.size());
  
 -
          //
@@ -270,6 +295,8 @@ Index: main.cpp
 -            CTxDB txdb("r");
 -
 -            // Priority order to process transactions
+-            list<COrphan> vOrphan; // list memory doesn't move
+-            map<uint256, vector<COrphan*> > mapDependers;
 -            multimap<double, CTransaction*> mapPriority;
 -            for (map<uint256, CTransaction>::iterator mi = mapTransactions.begin(); mi != mapTransactions.end(); ++mi)
 -            {
@@ -277,6 +304,7 @@ Index: main.cpp
 -                if (tx.IsCoinBase() || !tx.IsFinal())
 -                    continue;
 -
+-                COrphan* porphan = NULL;
 -                double dPriority = 0;
 -                foreach(const CTxIn& txin, tx.vin)
 -                {
@@ -284,7 +312,18 @@ Index: main.cpp
 -                    CTransaction txPrev;
 -                    CTxIndex txindex;
 -                    if (!txPrev.ReadFromDisk(txdb, txin.prevout, txindex))
+-                    {
+-                        // Has to wait for dependencies
+-                        if (!porphan)
+-                        {
+-                            // Use list for automatic deletion
+-                            vOrphan.push_back(COrphan(&tx));
+-                            porphan = &vOrphan.back();
+-                        }
+-                        mapDependers[txin.prevout.hash].push_back(porphan);
+-                        porphan->setDependsOn.insert(txin.prevout.hash);
 -                        continue;
+-                    }
 -                    int64 nValueIn = txPrev.vout[txin.prevout.n].nValue;
 -
 -                    // Read block header
@@ -310,55 +349,68 @@ Index: main.cpp
 -                // Priority is sum(valuein * age) / txsize
 -                dPriority /= ::GetSerializeSize(tx, SER_NETWORK);
 -
--                mapPriority.insert(make_pair(-dPriority, &(*mi).second));
+-                if (porphan)
+-                    porphan->dPriority = dPriority;
+-                else
+-                    mapPriority.insert(make_pair(-dPriority, &(*mi).second));
 -
 -                if (fDebug && mapArgs.count("-printpriority"))
--                    printf("priority %-20.1f %s\n%s\n", dPriority, tx.GetHash().ToString().substr(0,10).c_str(), tx.ToString().c_str());
+-                {
+-                    printf("priority %-20.1f %s\n%s", dPriority, tx.GetHash().ToString().substr(0,10).c_str(), tx.ToString().c_str());
+-                    if (porphan)
+-                        porphan->print();
+-                    printf("\n");
+-                }
 -            }
 -
 -            // Collect transactions into block
 -            map<uint256, CTxIndex> mapTestPool;
 -            uint64 nBlockSize = 1000;
 -            int nBlockSigOps = 100;
--            bool fFoundSomething = true;
--            while (fFoundSomething)
+-            while (!mapPriority.empty())
 -            {
--                fFoundSomething = false;
--                for (multimap<double, CTransaction*>::iterator mi = mapPriority.begin(); mi != mapPriority.end();)
+-                // Take highest priority transaction off priority queue
+-                double dPriority = -(*mapPriority.begin()).first;
+-                CTransaction& tx = *(*mapPriority.begin()).second;
+-                mapPriority.erase(mapPriority.begin());
+-
+-                // Size limits
+-                unsigned int nTxSize = ::GetSerializeSize(tx, SER_NETWORK);
+-                if (nBlockSize + nTxSize >= MAX_BLOCK_SIZE_GEN)
+-                    continue;
+-                int nTxSigOps = tx.GetSigOpCount();
+-                if (nBlockSigOps + nTxSigOps >= MAX_BLOCK_SIGOPS)
+-                    continue;
+-
+-                // Transaction fee required depends on block size
+-                bool fAllowFree = (nBlockSize + nTxSize < 4000 || dPriority > COIN * 144 / 250);
+-                int64 nMinFee = tx.GetMinFee(nBlockSize, fAllowFree);
+-
+-                // Connecting shouldn't fail due to dependency on other memory pool transactions
+-                // because we're already processing them in order of dependency
+-                map<uint256, CTxIndex> mapTestPoolTmp(mapTestPool);
+-                if (!tx.ConnectInputs(txdb, mapTestPoolTmp, CDiskTxPos(1,1,1), pindexPrev, nFees, false, true, nMinFee))
+-                    continue;
+-                swap(mapTestPool, mapTestPoolTmp);
+-
+-                // Added
+-                pblock->vtx.push_back(tx);
+-                nBlockSize += nTxSize;
+-                nBlockSigOps += nTxSigOps;
+-
+-                // Add transactions that depend on this one to the priority queue
+-                uint256 hash = tx.GetHash();
+-                if (mapDependers.count(hash))
 -                {
--                    CTransaction& tx = *(*mi).second;
--                    unsigned int nTxSize = ::GetSerializeSize(tx, SER_NETWORK);
--                    if (nBlockSize + nTxSize >= MAX_BLOCK_SIZE_GEN)
+-                    foreach(COrphan* porphan, mapDependers[hash])
 -                    {
--                        mapPriority.erase(mi++);
--                        continue;
+-                        if (!porphan->setDependsOn.empty())
+-                        {
+-                            porphan->setDependsOn.erase(hash);
+-                            if (porphan->setDependsOn.empty())
+-                                mapPriority.insert(make_pair(-porphan->dPriority, porphan->ptx));
+-                        }
 -                    }
--                    int nTxSigOps = tx.GetSigOpCount();
--                    if (nBlockSigOps + nTxSigOps >= MAX_BLOCK_SIGOPS)
--                    {
--                        mapPriority.erase(mi++);
--                        continue;
--                    }
--
--                    // Transaction fee based on block size
--                    int64 nMinFee = tx.GetMinFee(nBlockSize);
--
--                    // Connecting can fail due to dependency on other memory pool transactions
--                    // that aren't in the block yet, so keep trying in later passes
--                    map<uint256, CTxIndex> mapTestPoolTmp(mapTestPool);
--                    if (!tx.ConnectInputs(txdb, mapTestPoolTmp, CDiskTxPos(1,1,1), pindexPrev, nFees, false, true, nMinFee))
--                    {
--                        mi++;
--                        continue;
--                    }
--                    swap(mapTestPool, mapTestPoolTmp);
--
--                    // Added
--                    pblock->vtx.push_back(tx);
--                    nBlockSize += nTxSize;
--                    nBlockSigOps += nTxSigOps;
--                    fFoundSomething = true;
--                    mapPriority.erase(mi++);
 -                }
 -            }
 -        }
@@ -417,7 +469,7 @@ Index: main.cpp
          uint256 hashbuf[2];
          uint256& hash = *alignup<16>(hashbuf);
          loop
-@@ -3267,35 +3297,13 @@
+@@ -3318,35 +3346,13 @@
                  if (hash <= hashTarget)
                  {
                      // Found a solution
@@ -459,7 +511,7 @@ Index: main.cpp
                      Sleep(500);
                      break;
                  }
-@@ -3350,8 +3358,7 @@
+@@ -3401,8 +3407,7 @@
                  break;
  
              // Update nTime every few seconds
@@ -471,7 +523,7 @@ Index: main.cpp
  }
 Index: main.h
 ===================================================================
---- main.h	(revision 181)
+--- main.h	(revision 186)
 +++ main.h	(working copy)
 @@ -60,6 +60,22 @@
  
@@ -507,7 +559,7 @@ Index: main.h
  
 Index: rpc.cpp
 ===================================================================
---- rpc.cpp	(revision 181)
+--- rpc.cpp	(revision 186)
 +++ rpc.cpp	(working copy)
 @@ -681,14 +681,73 @@
      return ret;
